@@ -56,7 +56,7 @@ export async function runStatus(configPath: string): Promise<void> {
 
   } else if (platform === "linux") {
     try {
-      const output = execSync("systemctl --user is-active claude-discord", { encoding: "utf-8" }).trim();
+      const output = execSync("systemctl --user is-active claude-discord 2>/dev/null", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
       console.log(`Systemd service: ${output}`);
     } catch {
       console.log("Systemd service: not installed or inactive");
