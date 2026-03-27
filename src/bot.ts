@@ -58,12 +58,31 @@ function keepTyping(channel: TextChannel | ThreadChannel): () => void {
   return () => { alive = false; };
 }
 
-// Debounced progress sender — batches rapid tool events
+// Debounced progress sender — batches and merges consecutive same-type tool events
 function createProgressSender(channel: TextChannel | ThreadChannel) {
   let queue: string[] = [];
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  // Track consecutive same-tool calls for merging
+  let pendingTool = "";       // e.g. "Read"
+  let pendingLabel = "";      // e.g. "Reading"
+  let pendingFiles: string[] = [];
+
+  const flushPending = () => {
+    if (pendingFiles.length === 0) return;
+    if (pendingFiles.length === 1) {
+      queue.push(`> ${pendingLabel} \`${pendingFiles[0]}\``);
+    } else {
+      const fileList = pendingFiles.map((f) => `>   \`${f}\``).join("\n");
+      queue.push(`> ${pendingLabel} ${pendingFiles.length} files...\n${fileList}`);
+    }
+    pendingTool = "";
+    pendingLabel = "";
+    pendingFiles = [];
+  };
+
   const flush = async () => {
+    flushPending();
     if (queue.length === 0) return;
     const lines = queue.splice(0);
     const text = lines.join("\n").slice(0, DISCORD_MSG_LIMIT);
@@ -73,11 +92,47 @@ function createProgressSender(channel: TextChannel | ThreadChannel) {
   };
 
   return {
+    pushTool(tool: string, summary: string) {
+      // Detect file-based tools that can be merged
+      const mergeableTools: Record<string, string> = {
+        Read: "Reading",
+        read_file: "Reading",
+        Edit: "Editing",
+        edit_file: "Editing",
+        Write: "Writing",
+        write_file: "Writing",
+      };
+
+      const label = mergeableTools[tool];
+      if (label) {
+        // Extract filename from summary like "Reading `src/bot.ts`"
+        const match = summary.match(/`([^`]+)`/);
+        const fileName = match ? match[1] : tool;
+
+        if (pendingTool === tool) {
+          // Same tool type — accumulate
+          pendingFiles.push(fileName);
+        } else {
+          // Different tool — flush previous, start new group
+          flushPending();
+          pendingTool = tool;
+          pendingLabel = label;
+          pendingFiles = [fileName];
+        }
+      } else {
+        // Non-mergeable tool — flush pending, add directly
+        flushPending();
+        queue.push(`> ${summary}`);
+      }
+
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { flush(); }, 1500);
+    },
     push(line: string) {
+      flushPending();
       queue.push(line);
       if (timer) clearTimeout(timer);
-      // Batch events within 1.5s to avoid flooding
-      timer = setTimeout(flush, 1500);
+      timer = setTimeout(() => { flush(); }, 1500);
     },
     async finish() {
       if (timer) clearTimeout(timer);
@@ -120,7 +175,7 @@ async function handleAgentRun(
       if (textBuffer.trim()) {
         flushText();
       }
-      progress.push(`> ${event.summary}`);
+      progress.pushTool(event.tool, event.summary);
     },
     onToolResult(toolName, success) {
       if (!success) {
