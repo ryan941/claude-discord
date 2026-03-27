@@ -97,16 +97,57 @@ async function handleAgentRun(
   const stopTyping = keepTyping(channel);
   const progress = createProgressSender(channel);
 
+  let thinkingNotified = false;
+  let textBuffer = "";
+  let textTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Flush accumulated assistant text as a message
+  const flushText = async () => {
+    if (textBuffer.trim().length === 0) return;
+    const text = textBuffer.trim();
+    textBuffer = "";
+    // Send intermediate text as a quote block to distinguish from final result
+    const truncated = text.length > 1800 ? text.slice(0, 1800) + "\n..." : text;
+    try {
+      await channel.send(truncated);
+    } catch {}
+  };
+
   const callbacks: StreamCallbacks = {
     onToolUse(event) {
+      // Flush any pending text before showing tool use
+      if (textTimer) { clearTimeout(textTimer); textTimer = null; }
+      if (textBuffer.trim()) {
+        flushText();
+      }
       progress.push(`> ${event.summary}`);
+    },
+    onToolResult(toolName, success) {
+      if (!success) {
+        progress.push(`> ${toolName} failed`);
+      }
+    },
+    onThinking() {
+      if (!thinkingNotified) {
+        thinkingNotified = true;
+        progress.push("> Thinking...");
+      }
+    },
+    onText(text) {
+      thinkingNotified = false; // reset after thinking
+      textBuffer += text;
+      // Debounce: flush text after 3s of no new text
+      if (textTimer) clearTimeout(textTimer);
+      textTimer = setTimeout(() => { flushText(); }, 3000);
     },
   };
 
   try {
     const result = await runAgent(prompt, cwd, threadId, callbacks);
 
-    // Flush any remaining progress messages
+    // Flush any remaining buffers
+    if (textTimer) clearTimeout(textTimer);
+    await flushText();
     await progress.finish();
     stopTyping();
 
@@ -124,6 +165,7 @@ async function handleAgentRun(
       }
     }
   } catch (err) {
+    if (textTimer) clearTimeout(textTimer);
     stopTyping();
     await progress.finish();
     const errorMsg = err instanceof Error ? err.message : String(err);
