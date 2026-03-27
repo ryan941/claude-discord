@@ -1,6 +1,6 @@
 {
   "name": "claude-discord",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Run Claude Code from Discord — auto-sync project channels, manage sessions in threads",
   "main": "dist/index.js",
   "bin": {
