@@ -4,10 +4,13 @@ import {
   Message,
   MessageType,
   Partials,
+  TextChannel,
+  ThreadChannel,
   ThreadAutoArchiveDuration,
 } from "discord.js";
 import { BotConfig } from "./config";
-import { runAgent } from "./agent";
+import { runAgent, StreamCallbacks } from "./agent";
+import { resolveSkill, buildSkillPrompt, listSkills, preloadSkills, isSkillCommand } from "./skills";
 
 const DISCORD_MSG_LIMIT = 2000;
 
@@ -41,6 +44,97 @@ function resolveProjectCwd(
   return config.channelProjects.get(channelId) ?? null;
 }
 
+// Keep typing indicator alive until the returned stop function is called
+function keepTyping(channel: TextChannel | ThreadChannel): () => void {
+  let alive = true;
+
+  const tick = () => {
+    if (!alive) return;
+    channel.sendTyping().catch(() => {});
+    setTimeout(tick, 8000); // Discord typing lasts ~10s, refresh every 8s
+  };
+  tick();
+
+  return () => { alive = false; };
+}
+
+// Debounced progress sender — batches rapid tool events
+function createProgressSender(channel: TextChannel | ThreadChannel) {
+  let queue: string[] = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const flush = async () => {
+    if (queue.length === 0) return;
+    const lines = queue.splice(0);
+    const text = lines.join("\n").slice(0, DISCORD_MSG_LIMIT);
+    try {
+      await channel.send(text);
+    } catch {}
+  };
+
+  return {
+    push(line: string) {
+      queue.push(line);
+      if (timer) clearTimeout(timer);
+      // Batch events within 1.5s to avoid flooding
+      timer = setTimeout(flush, 1500);
+    },
+    async finish() {
+      if (timer) clearTimeout(timer);
+      await flush();
+    },
+  };
+}
+
+async function handleAgentRun(
+  channel: TextChannel | ThreadChannel,
+  prompt: string,
+  cwd: string,
+  threadId: string,
+  isReply: boolean,
+  replyTarget?: Message
+): Promise<void> {
+  const stopTyping = keepTyping(channel);
+  const progress = createProgressSender(channel);
+
+  const callbacks: StreamCallbacks = {
+    onToolUse(event) {
+      progress.push(`> ${event.summary}`);
+    },
+  };
+
+  try {
+    const result = await runAgent(prompt, cwd, threadId, callbacks);
+
+    // Flush any remaining progress messages
+    await progress.finish();
+    stopTyping();
+
+    // Send final result
+    const costInfo = result.cost != null ? `\n-# Cost: $${result.cost.toFixed(4)}` : "";
+    const resultText = (result.text || "(no response)") + costInfo;
+    const chunks = splitMessage(resultText);
+
+    for (const chunk of chunks) {
+      if (isReply && replyTarget) {
+        await replyTarget.reply(chunk);
+        replyTarget = undefined; // only reply to the first chunk
+      } else {
+        await channel.send(chunk);
+      }
+    }
+  } catch (err) {
+    stopTyping();
+    await progress.finish();
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (isReply && replyTarget) {
+      await replyTarget.reply(`Agent error: ${errorMsg}`);
+    } else {
+      await channel.send(`Agent error: ${errorMsg}`);
+    }
+  }
+}
+
 export function createBot(config: BotConfig): Client {
   const client = new Client({
     intents: [
@@ -56,6 +150,14 @@ export function createBot(config: BotConfig): Client {
     console.log(
       `Mapped channels: ${[...config.channelProjects.entries()].map(([id, path]) => `${id} → ${path}`).join(", ")}`
     );
+
+    // Preload skills for all bound projects
+    for (const [, cwd] of config.channelProjects) {
+      const skills = preloadSkills(cwd);
+      if (skills.length > 0) {
+        console.log(`[skills] ${cwd}: ${skills.join(", ")}`);
+      }
+    }
   });
 
   client.on("messageCreate", async (message: Message) => {
@@ -69,7 +171,11 @@ export function createBot(config: BotConfig): Client {
     ) {
       const projectPath = message.content.slice("/bind ".length).trim();
       config.channelProjects.set(message.channel.id, projectPath);
-      await message.reply(`Bound this channel to: \`${projectPath}\``);
+      const skills = preloadSkills(projectPath);
+      const skillInfo = skills.length > 0
+        ? `\nAvailable skills: ${skills.map((s) => `\`/${s}\``).join(", ")}`
+        : "";
+      await message.reply(`Bound this channel to: \`${projectPath}\`${skillInfo}`);
       return;
     }
 
@@ -93,30 +199,52 @@ export function createBot(config: BotConfig): Client {
       return;
     }
 
+    // --- Admin command: /skills ---
+    if (message.content === "/skills") {
+      // Resolve cwd from channel or parent channel
+      const channelId = message.channel.isThread()
+        ? message.channel.parentId || ""
+        : message.channel.id;
+      const cwd = resolveProjectCwd(channelId, config);
+      if (!cwd) {
+        await message.reply("This channel is not bound to a project.");
+        return;
+      }
+      const skills = listSkills(cwd);
+      if (skills.length === 0) {
+        await message.reply("No skills found in this project or user config.");
+      } else {
+        await message.reply(
+          `**Available skills:**\n${skills.map((s) => `\`/${s}\``).join(", ")}`
+        );
+      }
+      return;
+    }
+
     // --- Message in a channel (not a thread) → create thread ---
     if (!message.channel.isThread()) {
       const cwd = resolveProjectCwd(message.channel.id, config);
-      if (!cwd) return; // Not a bound channel, ignore
+      if (!cwd) return;
 
-      const threadName = message.content.slice(0, 95) || "New task";
+      // Resolve skill if message starts with /
+      const skill = resolveSkill(message.content, cwd);
+      const prompt = skill
+        ? buildSkillPrompt(skill, message.content)
+        : message.content;
+      const threadName = skill
+        ? `/${skill.name} ${skill.args}`.slice(0, 95)
+        : message.content.slice(0, 95) || "New task";
 
       const thread = await message.startThread({
         name: threadName,
         autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
       });
 
-      await thread.sendTyping();
-
-      try {
-        const result = await runAgent(message.content, cwd, thread.id);
-        const chunks = splitMessage(result.text || "(no response)");
-        for (const chunk of chunks) {
-          await thread.send(chunk);
-        }
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        await thread.send(`Agent error: ${errorMsg}`);
+      if (skill) {
+        await thread.send(`> Loaded skill: **${skill.name}**`);
       }
+
+      await handleAgentRun(thread, prompt, cwd, thread.id, false);
       return;
     }
 
@@ -125,24 +253,26 @@ export function createBot(config: BotConfig): Client {
     if (!parentId) return;
 
     const cwd = resolveProjectCwd(parentId, config);
-    if (!cwd) return; // Parent channel not bound
+    if (!cwd) return;
 
-    await message.channel.sendTyping();
+    // Resolve skill in thread messages too
+    const skill = resolveSkill(message.content, cwd);
+    const prompt = skill
+      ? buildSkillPrompt(skill, message.content)
+      : message.content;
 
-    try {
-      const result = await runAgent(
-        message.content,
-        cwd,
-        message.channel.id
-      );
-      const chunks = splitMessage(result.text || "(no response)");
-      for (const chunk of chunks) {
-        await message.reply(chunk);
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      await message.reply(`Agent error: ${errorMsg}`);
+    if (skill) {
+      await message.channel.send(`> Loaded skill: **${skill.name}**`);
     }
+
+    await handleAgentRun(
+      message.channel,
+      prompt,
+      cwd,
+      message.channel.id,
+      true,
+      message
+    );
   });
 
   return client;
