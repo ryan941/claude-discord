@@ -5,26 +5,37 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import { loadConfig } from "./config";
-import { createBot } from "./bot";
-import { syncProjects, startWatcher } from "./watcher";
+import { PlatformAdapter } from "./platforms/types";
+import { createDiscordAdapter } from "./platforms/discord/bot";
+import { createSlackAdapter } from "./platforms/slack/bot";
 
-async function main() {
+export async function startAll(platform?: "discord" | "slack" | "all"): Promise<PlatformAdapter[]> {
   const config = loadConfig();
-  const bot = createBot(config);
+  const adapters: PlatformAdapter[] = [];
+  const target = platform || "all";
 
-  bot.once("clientReady", async () => {
-    try {
-      await syncProjects(bot, config);
-      startWatcher(bot, config);
-    } catch (err) {
-      console.error("[watcher] Initial sync failed:", err);
-    }
-  });
+  if ((target === "all" || target === "discord") && config.discord) {
+    adapters.push(createDiscordAdapter(config.discord, config.watchDir));
+  }
 
-  await bot.login(config.discordToken);
+  if ((target === "all" || target === "slack") && config.slack) {
+    adapters.push(createSlackAdapter(config.slack, config.watchDir));
+  }
+
+  if (adapters.length === 0) {
+    throw new Error(`No configured platform matches "${target}"`);
+  }
+
+  await Promise.all(adapters.map((a) => a.start()));
+
+  console.log(`Running platforms: ${adapters.map((a) => a.name).join(", ")}`);
+  return adapters;
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+// Direct execution: start all configured platforms
+if (require.main === module) {
+  startAll().catch((err) => {
+    console.error("Fatal:", err);
+    process.exit(1);
+  });
+}

@@ -8,7 +8,7 @@ const command = args[0];
 
 function printHelp(): void {
   console.log(`
-claude-discord — Run Claude Code from Discord
+claude-discord — Run Claude Code from Discord and Slack
 
 Usage:
   claude-discord <command> [options]
@@ -21,9 +21,10 @@ Commands:
   status            Show service status and config info
 
 Options:
-  -c, --config <path>   Path to .env config file (default: ~/.claude-discord/.env)
-  -h, --help            Show this help message
-  -v, --version         Show version
+  -c, --config <path>       Path to .env config file (default: ~/.claude-discord/.env)
+  -p, --platform <platform> Platform to start: discord, slack, or all (default: all)
+  -h, --help                Show this help message
+  -v, --version             Show version
 `);
 }
 
@@ -33,6 +34,17 @@ function getConfigPath(): string {
     return resolve(args[idx + 1]);
   }
   return resolve(process.env.HOME || "~", ".claude-discord", ".env");
+}
+
+function getPlatform(): "discord" | "slack" | "all" {
+  const idx = args.indexOf("-p") !== -1 ? args.indexOf("-p") : args.indexOf("--platform");
+  if (idx !== -1 && args[idx + 1]) {
+    const val = args[idx + 1];
+    if (val === "discord" || val === "slack" || val === "all") return val;
+    console.error(`Invalid platform: ${val}. Must be discord, slack, or all.`);
+    process.exit(1);
+  }
+  return "all";
 }
 
 async function main(): Promise<void> {
@@ -61,8 +73,9 @@ async function main(): Promise<void> {
         console.error('Run "claude-discord init" first.');
         process.exit(1);
       }
+      const platform = getPlatform();
       const { runStart } = await import("./commands/start");
-      await runStart(configPath);
+      await runStart(configPath, platform);
       break;
     }
     case "install-service": {

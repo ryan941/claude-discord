@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, existsSync, readFileSync } from "fs";
+import { mkdirSync, writeFileSync, existsSync } from "fs";
 import { dirname } from "path";
 import { createInterface } from "readline";
 
@@ -27,31 +27,43 @@ export async function runInit(configPath: string): Promise<void> {
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-  console.log("You'll need:");
-  console.log("  1. A Discord Bot Token (https://discord.com/developers/applications)");
-  console.log("  2. Your Discord Server (Guild) ID");
-  console.log("  3. The directory where your code projects live\n");
+  console.log("At least one platform (Discord or Slack) must be configured.\n");
 
+  // === Discord ===
+  console.log("=== Discord Configuration (leave token empty to skip) ===");
   const discordToken = await ask(rl, "Discord Bot Token");
-  if (!discordToken) {
-    console.error("Discord Bot Token is required.");
+  let guildId = "";
+  let categoryId = "";
+
+  if (discordToken) {
+    guildId = await ask(rl, "Discord Server (Guild) ID");
+    categoryId = await ask(rl, 'Category ID (leave empty to auto-create "Projects")', "");
+  }
+
+  // === Slack ===
+  console.log("\n=== Slack Configuration (leave token empty to skip) ===");
+  const slackBotToken = await ask(rl, "Slack Bot Token (xoxb-...)");
+  let slackAppToken = "";
+
+  if (slackBotToken) {
+    slackAppToken = await ask(rl, "Slack App Token (xapp-...)");
+    if (!slackAppToken) {
+      console.log("  Warning: Slack App Token is required for Socket Mode.");
+    }
+  }
+
+  // Validate at least one platform
+  if (!discordToken && !slackBotToken) {
+    console.error("\nAt least one platform must be configured.");
     rl.close();
     process.exit(1);
   }
 
-  const guildId = await ask(rl, "Discord Server (Guild) ID");
-  if (!guildId) {
-    console.error("Guild ID is required.");
-    rl.close();
-    process.exit(1);
-  }
-
+  // === Shared ===
+  console.log("\n=== Shared Configuration ===");
   const homeDir = process.env.HOME || "~";
   const defaultWatchDir = `${homeDir}/Documents/code`;
   const watchDir = await ask(rl, "Projects directory to watch", defaultWatchDir);
-
-  const categoryId = await ask(rl, 'Category ID (leave empty to auto-create "Projects")', "");
-
   const anthropicKey = await ask(rl, "Anthropic API Key (leave empty if using claude login)", "");
 
   rl.close();
@@ -61,19 +73,36 @@ export async function runInit(configPath: string): Promise<void> {
     "# claude-discord configuration",
     `# Generated on ${new Date().toISOString()}`,
     "",
-    `DISCORD_TOKEN=${discordToken}`,
-    "",
-    `GUILD_ID=${guildId}`,
-    `WATCH_DIR=${watchDir}`,
   ];
 
-  if (categoryId) {
-    lines.push(`CATEGORY_ID=${categoryId}`);
-  } else {
-    lines.push("# CATEGORY_ID=");
+  // Discord section
+  if (discordToken) {
+    lines.push("# === Discord ===");
+    lines.push(`DISCORD_TOKEN=${discordToken}`);
+    lines.push(`GUILD_ID=${guildId}`);
+    if (categoryId) {
+      lines.push(`CATEGORY_ID=${categoryId}`);
+    } else {
+      lines.push("# CATEGORY_ID=");
+    }
+    lines.push("CHANNEL_PROJECTS={}");
+    lines.push("");
   }
 
-  lines.push("");
+  // Slack section
+  if (slackBotToken) {
+    lines.push("# === Slack ===");
+    lines.push(`SLACK_BOT_TOKEN=${slackBotToken}`);
+    if (slackAppToken) {
+      lines.push(`SLACK_APP_TOKEN=${slackAppToken}`);
+    }
+    lines.push("# SLACK_CHANNEL_PROJECTS={}");
+    lines.push("");
+  }
+
+  // Shared section
+  lines.push("# === Shared ===");
+  lines.push(`WATCH_DIR=${watchDir}`);
 
   if (anthropicKey) {
     lines.push(`ANTHROPIC_API_KEY=${anthropicKey}`);
@@ -81,9 +110,6 @@ export async function runInit(configPath: string): Promise<void> {
     lines.push("# ANTHROPIC_API_KEY=");
   }
 
-  lines.push("");
-  lines.push("# Manual channel bindings (optional, JSON format)");
-  lines.push("CHANNEL_PROJECTS={}");
   lines.push("");
 
   const content = lines.join("\n");
@@ -94,8 +120,13 @@ export async function runInit(configPath: string): Promise<void> {
   writeFileSync(configPath, content, "utf-8");
 
   console.log(`\nConfig saved to ${configPath}`);
-  console.log('\nNext steps:');
-  console.log('  1. Make sure your bot is invited to the server with "Manage Channels" permission');
-  console.log('  2. Run "claude-discord start" to start the bot');
-  console.log('  3. Or run "claude-discord install-service" to run it as a background service');
+  console.log("\nNext steps:");
+  if (discordToken) {
+    console.log('  - Discord: Invite bot to server with "Manage Channels" permission');
+  }
+  if (slackBotToken) {
+    console.log("  - Slack: Enable Socket Mode and subscribe to message.channels event");
+  }
+  console.log('  - Run "claude-discord start" to start the bot');
+  console.log('  - Or run "claude-discord install-service" to run it as a background service');
 }

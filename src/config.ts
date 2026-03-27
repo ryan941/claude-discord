@@ -1,29 +1,62 @@
-export interface BotConfig {
-  discordToken: string;
-  channelProjects: Map<string, string>; // channelId → project cwd
-  guildId?: string;       // Discord server ID for auto-channel management
-  watchDir?: string;      // Directory to watch for project folders
-  categoryId?: string;    // Optional: category to put project channels under
+export interface DiscordConfig {
+  token: string;
+  channelProjects: Map<string, string>;
+  guildId?: string;
+  categoryId?: string;
 }
 
-export function loadConfig(): BotConfig {
-  const discordToken = process.env.DISCORD_TOKEN;
-  if (!discordToken) {
-    throw new Error("Missing DISCORD_TOKEN in .env");
-  }
+export interface SlackConfig {
+  botToken: string;
+  appToken: string;
+  channelProjects: Map<string, string>;
+}
 
-  const channelProjects = new Map<string, string>();
-  const raw = process.env.CHANNEL_PROJECTS;
-  if (raw) {
+export interface AppConfig {
+  discord?: DiscordConfig;
+  slack?: SlackConfig;
+  watchDir?: string;
+}
+
+function parseChannelProjects(raw?: string): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!raw) return map;
+  try {
     const parsed = JSON.parse(raw) as Record<string, string>;
     for (const [channelId, projectPath] of Object.entries(parsed)) {
-      channelProjects.set(channelId, projectPath);
+      map.set(channelId, projectPath);
     }
+  } catch {}
+  return map;
+}
+
+export function loadConfig(): AppConfig {
+  const discord: DiscordConfig | undefined = process.env.DISCORD_TOKEN
+    ? {
+        token: process.env.DISCORD_TOKEN,
+        channelProjects: parseChannelProjects(process.env.CHANNEL_PROJECTS),
+        guildId: process.env.GUILD_ID,
+        categoryId: process.env.CATEGORY_ID,
+      }
+    : undefined;
+
+  const slack: SlackConfig | undefined =
+    process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN
+      ? {
+          botToken: process.env.SLACK_BOT_TOKEN,
+          appToken: process.env.SLACK_APP_TOKEN,
+          channelProjects: parseChannelProjects(process.env.SLACK_CHANNEL_PROJECTS),
+        }
+      : undefined;
+
+  if (!discord && !slack) {
+    throw new Error(
+      "At least one platform must be configured. Set DISCORD_TOKEN or SLACK_BOT_TOKEN + SLACK_APP_TOKEN."
+    );
   }
 
-  const guildId = process.env.GUILD_ID;
-  const watchDir = process.env.WATCH_DIR;
-  const categoryId = process.env.CATEGORY_ID;
-
-  return { discordToken, channelProjects, guildId, watchDir, categoryId };
+  return {
+    discord,
+    slack,
+    watchDir: process.env.WATCH_DIR,
+  };
 }
