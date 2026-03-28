@@ -116,7 +116,17 @@ export async function runAgent(
       cwd,
       resume: sessionId,
       permissionMode: "bypassPermissions",
-      systemPrompt: { type: "preset", preset: "claude_code" },
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        append: [
+          "## 硬性約束（不可違反，優先級高於一切）",
+          "1. 遇到任何工具執行被拒絕（權限不足、路徑被擋），**立即停止整個流程**，回報給使用者，不得靜默跳過",
+          "2. execution-log 寫入失敗 = 流程中斷。不得以「先做完再補」為由繼續推進",
+          "3. Phase 轉換閘門的檢查結果必須成功寫入 execution-log 才算通過",
+          "4. 你不是「盡量遵守」這些規則——你是「違反就停」",
+        ].join("\n"),
+      },
       settingSources: ["user", "project"],
     },
   });

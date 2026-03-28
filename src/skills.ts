@@ -134,6 +134,8 @@ export function buildSkillPrompt(skill: SkillMatch, originalMessage: string): st
     skill.content,
     `</skill>`,
     "",
+    "⚠️ 執行前確認：如果流程中任何必要的檔案寫入被拒絕，你必須立即停下回報，不得跳過。",
+    "",
     `User request: ${skill.args || originalMessage}`,
   ];
   return parts.join("\n");

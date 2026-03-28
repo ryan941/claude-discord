@@ -128,8 +128,14 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
 
     // --- Message in a channel (not a thread) → create thread ---
     if (!message.channel.isThread()) {
-      const cwd = resolveProjectCwd(message.channel.id, config);
-      if (!cwd) return;
+      let cwd = resolveProjectCwd(message.channel.id, config);
+
+      // Allow /capture in unbound channels — it only writes to Obsidian, no project needed
+      if (!cwd) {
+        const isCapture = message.content.toLowerCase().startsWith("/capture");
+        if (!isCapture) return;
+        cwd = process.env.HOME || "/tmp";
+      }
 
       const skill = resolveSkill(message.content, cwd);
       const prompt = skill
@@ -163,8 +169,12 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
     const parentId = message.channel.parentId;
     if (!parentId) return;
 
-    const cwd = resolveProjectCwd(parentId, config);
-    if (!cwd) return;
+    let cwd = resolveProjectCwd(parentId, config);
+    if (!cwd) {
+      const isCapture = message.content.toLowerCase().startsWith("/capture");
+      if (!isCapture) return;
+      cwd = process.env.HOME || "/tmp";
+    }
 
     const skill = resolveSkill(message.content, cwd);
     const prompt = skill
