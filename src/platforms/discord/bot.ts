@@ -9,7 +9,7 @@ import {
   ThreadAutoArchiveDuration,
 } from "discord.js";
 import { DiscordConfig } from "../../config";
-import { ChatChannel, PlatformAdapter, ReplyHandler } from "../types";
+import { ChatChannel, PlatformAdapter, ReplyHandler, VerbosityMode } from "../types";
 import { handleAgentRun, splitMessage } from "../utils";
 import { resolveSkill, buildSkillPrompt, listSkills, preloadSkills } from "../../skills";
 import { syncProjects, startWatcher } from "./watcher";
@@ -27,8 +27,24 @@ function wrapDiscordChannel(ch: TextChannel | ThreadChannel): { channel: ChatCha
 
   return {
     channel: {
-      send: async (text) => { await ch.send(text); },
+      send: async (text) => {
+        const msg = await ch.send(text);
+        return msg.id;
+      },
       sendTyping: () => { alive = true; tick(); },
+      edit: async (messageId, text) => {
+        const msg = await ch.messages.fetch(messageId);
+        await msg.edit(text);
+      },
+      react: async (messageId, emoji) => {
+        const msg = await ch.messages.fetch(messageId);
+        await msg.react(emoji);
+      },
+      removeReact: async (messageId, emoji) => {
+        const msg = await ch.messages.fetch(messageId);
+        const reaction = msg.reactions.cache.find((r) => r.emoji.name === emoji);
+        if (reaction) await reaction.users.remove(ch.client.user?.id);
+      },
     },
     stop: () => { alive = false; },
   };
@@ -39,6 +55,10 @@ function resolveProjectCwd(channelId: string, config: DiscordConfig): string | n
 }
 
 export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): PlatformAdapter {
+  const channelVerbosity = new Map<string, VerbosityMode>();
+  const getVerbosity = (channelId: string): VerbosityMode =>
+    channelVerbosity.get(channelId) ?? "normal";
+
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -126,6 +146,21 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
       return;
     }
 
+    // --- Admin command: /quiet, /normal, /verbose ---
+    const verbosityCommands: Record<string, VerbosityMode> = {
+      "/quiet": "quiet",
+      "/normal": "normal",
+      "/verbose": "verbose",
+    };
+    if (message.content in verbosityCommands && !message.channel.isThread()) {
+      const channelId = message.channel.id;
+      if (!resolveProjectCwd(channelId, config)) return;
+      const mode = verbosityCommands[message.content];
+      channelVerbosity.set(channelId, mode);
+      await message.reply(`Verbosity set to **${mode}**`);
+      return;
+    }
+
     // --- Message in a channel (not a thread) → create thread ---
     if (!message.channel.isThread()) {
       let cwd = resolveProjectCwd(message.channel.id, config);
@@ -160,7 +195,8 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
         sendError: async (errMsg) => { await thread.send(`Agent error: ${errMsg}`); },
       };
 
-      await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT);
+      const verbosity = getVerbosity(message.channel.id);
+      await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT, verbosity, message.id);
       stop();
       return;
     }
@@ -206,7 +242,8 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
       },
     };
 
-    await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT);
+    const verbosity = getVerbosity(parentId);
+    await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT, verbosity, message.id);
     stop();
   });
 

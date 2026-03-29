@@ -1,11 +1,12 @@
-# 技術可行性報告 — Slack 平台擴充
+# 技術可行性報告 — claude-discord Multi-Platform Bot
 
 ## 文件資訊
 
 | 項目 | 內容 |
 |------|------|
-| 版本 | v1.0 |
+| 版本 | v1.1 |
 | 建立日期 | 2026-03-27 |
+| 最後修改 | 2026-03-29 |
 | 規模等級 | S（CLI 工具 + Bot） |
 
 ---
@@ -173,8 +174,138 @@ Slack 的 thread 是在原始訊息下回覆（使用 `thread_ts`）。`say({ te
 
 ---
 
+## 7. Verbosity Modes 可行性評估（v1.1 新增）
+
+### 7.1 平台 API 能力確認
+
+| 能力 | Discord（discord.js v14.25.1） | Slack（@slack/bolt v4.6.0） | 現有使用 |
+|------|------|------|------|
+| 發送訊息 | `channel.send()` → 回傳 `Message` 物件 | `client.chat.postMessage()` → 回傳含 `ts` 的 response | ✅ 已使用 |
+| 編輯訊息 | `Message.edit(newText)` | `client.chat.update({ channel, ts, text })` | ❌ 未使用，API 可用 |
+| 加 Reaction | `Message.react(emoji)` | `client.reactions.add({ channel, timestamp, name })` | ❌ 未使用，API 可用 |
+| 移除 Reaction | `MessageReaction.remove()` （bot 自己的） | `client.reactions.remove({ channel, timestamp, name })` | ❌ 未使用，API 可用 |
+| 訊息識別 | `Message.id`（string） | `ts`（timestamp string） | — |
+
+**結論**：兩個平台都原生支援 edit-in-place 和 emoji reaction，無需第三方套件，無技術阻塞。
+
+### 7.2 ChatChannel 介面擴充方案
+
+現有介面：
+```typescript
+interface ChatChannel {
+  send(text: string): Promise<void>;
+  sendTyping(): void;
+}
+```
+
+擴充為：
+```typescript
+interface ChatChannel {
+  send(text: string): Promise<string | undefined>;  // 回傳 message ID
+  sendTyping(): void;
+  edit(messageId: string, text: string): Promise<void>;  // 新增
+  react(messageId: string, emoji: string): Promise<void>;  // 新增
+  removeReact(messageId: string, emoji: string): Promise<void>;  // 新增
+}
+```
+
+**設計決策**：
+
+1. **`send()` 回傳 message ID**：Discord 的 `channel.send()` 已回傳 `Message` 物件（含 `.id`），Slack 的 `chat.postMessage()` 已回傳含 `ts` 的 response。只需在 wrapper 中提取並回傳。向後相容——現有呼叫端只需忽略回傳值
+2. **`edit()` / `react()` / `removeReact()` 為必要方法**：兩個平台都支援，不需用 optional 增加複雜度。實作中用 `.catch(() => {})` 靜默處理失敗
+3. **不擴充 ReplyHandler**：verbosity 邏輯集中在 `handleAgentRun` 和 `createProgressSender`，ReplyHandler 只負責最終結果和錯誤，不受 verbosity 影響
+
+### 7.3 Edit-in-place 技術要點
+
+**Discord**：
+- `Message.edit()` 直接可用，無需 fetch（send 已回傳 Message 物件）
+- 限制：只能編輯 bot 自己發送的訊息 ✅（進度訊息由 bot 發送）
+- Rate limit：discord.js 內建佇列處理，無需額外管理
+
+**Slack**：
+- `chat.update({ channel, ts, text })` 需要 channel ID + message ts
+- 限制：只能更新 bot 自己發送的訊息 ✅；需要 `chat:write` scope（已有）
+- Rate limit：`chat.update` 與 `chat.postMessage` 共用 Tier 4 special（~1/s per channel）。現有 1.5s debounce 已滿足
+
+**訊息快取策略**：
+- `createProgressSender` 在第一次 flush 時呼叫 `send()`，快取回傳的 message ID
+- 後續 flush 使用快取的 ID 呼叫 `edit()`
+- 快取生命週期 = 單次 agent 執行（函式 scope，無記憶體洩漏風險）
+- 若 `edit()` 失敗（例如訊息已被刪除），fallback 為 `send()` 新訊息並更新快取
+
+**競態防護**：
+- 現有 debounce（1.5s）已大幅降低併發 edit 的機會
+- 額外加入簡單 lock：flush 進行中時暫存最新內容，flush 完成後再送最新版本
+- 不需要複雜的佇列機制——debounce + lock 已足夠
+
+### 7.4 Emoji Reaction 技術要點
+
+**Discord**：
+- `Message.react('⏳')` / `Message.react('✅')` / `Message.react('❌')`
+- 移除自己的 reaction：`reaction.users.remove(client.user.id)`
+- 需要存取使用者的原始 Message 物件（在 `messageCreate` handler 中已有）
+
+**Slack**：
+- `reactions.add({ channel, timestamp: message.ts, name: 'hourglass_flowing_sand' })`
+- `reactions.remove({ channel, timestamp: message.ts, name: 'hourglass_flowing_sand' })`
+- 需要額外 scope：**`reactions:write`**（v1.1 新增需求，需在 Slack App 設定頁面加入）
+- Emoji 名稱格式不同：Slack 用文字名稱（`hourglass_flowing_sand`），Discord 用 Unicode（`⏳`）
+
+**平台差異處理**：reaction 邏輯在各平台 adapter 內部實作，ChatChannel 介面統一接受 emoji 識別符，由 adapter 轉換為平台格式。
+
+### 7.5 Verbosity 狀態儲存方案
+
+**方案**：per-channel runtime Map，與 channelProjects 並列
+
+```typescript
+// 在各平台 adapter 內部
+const channelVerbosity = new Map<string, "quiet" | "normal" | "verbose">();
+```
+
+**設計決策**：
+- **不持久化**：重啟後重置為 `normal`。理由：verbosity 是臨時偏好，不是系統設定。使用者通常 set-and-forget，重啟後回到合理預設值即可
+- **per-channel**：不同頻道可能有不同偏好（例如 debug 頻道用 verbose，日常頻道用 normal）
+- **admin 指令解析**：沿用現有 `startsWith` 模式，在 `/bind`、`/unbind` 等指令旁加入 `/quiet`、`/normal`、`/verbose`
+
+### 7.6 變更量評估
+
+| 檔案 | 變更量 | 說明 |
+|------|--------|------|
+| platforms/types.ts | ~10 行修改 | ChatChannel 新增 edit/react/removeReact + send 回傳值調整 |
+| platforms/utils.ts | ~60 行修改 | createProgressSender 加入 verbosity 分支 + handleAgentRun 接收 verbosity + reaction 邏輯 |
+| platforms/discord/bot.ts | ~40 行修改 | wrapDiscordChannel 實作 edit/react + 解析 verbosity 指令 + 傳遞 reaction 用的 message 物件 |
+| platforms/slack/bot.ts | ~40 行修改 | chatChannel 實作 edit/react + 解析 verbosity 指令 |
+| agent.ts | 0 行 | 不動 |
+| skills.ts | 0 行 | 不動 |
+| config.ts | 0 行 | 不動（verbosity 不走 env var，走 runtime 指令） |
+
+**總計**：~150 行變更，全部是既有檔案的擴充，無新增檔案。
+
+### 7.7 風險評估
+
+| 風險 | 嚴重度 | 機率 | 緩解措施 |
+|------|--------|------|---------|
+| edit API 呼叫失敗 | 低 | 低 | fallback 為 send 新訊息 |
+| reaction API 缺少 scope | 低 | 中 | 靜默忽略 + README 說明所需 scope |
+| 1.5s debounce 下的 edit 競態 | 低 | 極低 | debounce 已天然防護 + 簡單 lock |
+| Slack emoji 名稱格式不符 | 低 | 低 | 平台 adapter 內部映射 |
+
+### 7.8 可行性判定
+
+**✅ 可行**
+
+- 兩個平台的 edit 和 reaction API 原生支援，成熟穩定
+- 變更量極小（~150 行），集中在 utils.ts 和兩個 adapter
+- agent.ts、skills.ts、config.ts 零修改
+- 所有失敗場景都有優雅降級（fallback 到現有行為）
+- 無新增依賴
+- 向後相容：未設定 verbosity 的頻道預設 normal，行為與 v1.1.0 一致
+
+---
+
 ## 變更記錄
 
 | 版本 | 日期 | 變更內容 | 變更者 |
 |------|------|---------|--------|
-| v1.0 | 2026-03-27 | 初版建立 | Architect |
+| v1.0 | 2026-03-27 | 初版建立（Slack 擴充） | Architect |
+| v1.1 | 2026-03-29 | 新增 Verbosity Modes 可行性評估（Section 7） | Architect |

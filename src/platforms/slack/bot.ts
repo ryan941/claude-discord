@@ -1,11 +1,17 @@
 import { App, LogLevel } from "@slack/bolt";
 import { SlackConfig } from "../../config";
-import { ChatChannel, PlatformAdapter, ReplyHandler } from "../types";
+import { ChatChannel, PlatformAdapter, ReplyHandler, VerbosityMode } from "../types";
 import { handleAgentRun } from "../utils";
 import { resolveSkill, buildSkillPrompt, listSkills, preloadSkills } from "../../skills";
 import { syncSlackProjects, startSlackWatcher } from "./watcher";
 
 const SLACK_MSG_LIMIT = 4000;
+
+const EMOJI_MAP: Record<string, string> = {
+  "⏳": "hourglass_flowing_sand",
+  "✅": "white_check_mark",
+  "❌": "x",
+};
 
 export function createSlackAdapter(config: SlackConfig, watchDir?: string): PlatformAdapter {
   const app = new App({
@@ -14,6 +20,10 @@ export function createSlackAdapter(config: SlackConfig, watchDir?: string): Plat
     socketMode: true,
     logLevel: LogLevel.WARN,
   });
+
+  const channelVerbosity = new Map<string, VerbosityMode>();
+  const getVerbosity = (channelId: string): VerbosityMode =>
+    channelVerbosity.get(channelId) ?? "normal";
 
   // Listen to all messages
   app.event("message", async ({ event, client }) => {
@@ -98,6 +108,23 @@ export function createSlackAdapter(config: SlackConfig, watchDir?: string): Plat
         }
         return;
       }
+      // --- Admin command: /quiet, /normal, /verbose ---
+      const verbosityCommands: Record<string, VerbosityMode> = {
+        "/quiet": "quiet",
+        "/normal": "normal",
+        "/verbose": "verbose",
+      };
+      if (text in verbosityCommands) {
+        if (!config.channelProjects.get(channelId)) return;
+        const mode = verbosityCommands[text];
+        channelVerbosity.set(channelId, mode);
+        await client.chat.postMessage({
+          channel: channelId,
+          text: `Verbosity set to *${mode}*`,
+          thread_ts: messageTs,
+        });
+        return;
+      }
     }
 
     // --- Resolve project ---
@@ -115,14 +142,38 @@ export function createSlackAdapter(config: SlackConfig, watchDir?: string): Plat
     // --- Wrap as ChatChannel ---
     const chatChannel: ChatChannel = {
       send: async (t) => {
-        await client.chat.postMessage({
+        const res = await client.chat.postMessage({
           channel: channelId,
           text: t,
           thread_ts: replyTs,
         });
+        return res.ts;
       },
       sendTyping: () => {
         // Slack has no persistent typing indicator API; noop
+      },
+      edit: async (messageId, text) => {
+        await client.chat.update({
+          channel: channelId,
+          ts: messageId,
+          text,
+        });
+      },
+      react: async (messageId, emoji) => {
+        const slackName = EMOJI_MAP[emoji] || emoji;
+        await client.reactions.add({
+          channel: channelId,
+          timestamp: messageId,
+          name: slackName,
+        });
+      },
+      removeReact: async (messageId, emoji) => {
+        const slackName = EMOJI_MAP[emoji] || emoji;
+        await client.reactions.remove({
+          channel: channelId,
+          timestamp: messageId,
+          name: slackName,
+        });
       },
     };
 
@@ -150,7 +201,8 @@ export function createSlackAdapter(config: SlackConfig, watchDir?: string): Plat
     }
 
     // --- Run agent ---
-    await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT);
+    const verbosity = getVerbosity(channelId);
+    await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT, verbosity, messageTs);
   });
 
   return {

@@ -1,4 +1,4 @@
-import { ChatChannel, ReplyHandler } from "./types";
+import { ChatChannel, ReplyHandler, VerbosityMode } from "./types";
 import { runAgent, StreamCallbacks } from "../agent";
 import { readdirSync, statSync, existsSync } from "fs";
 import { join } from "path";
@@ -29,13 +29,30 @@ export function splitMessage(text: string, limit: number): string[] {
 
 // --- Progress sender ---
 
-export function createProgressSender(channel: ChatChannel, msgLimit: number) {
+export function createProgressSender(
+  channel: ChatChannel,
+  msgLimit: number,
+  verbosity: VerbosityMode = "normal",
+) {
+  // quiet mode: all operations are noop
+  if (verbosity === "quiet") {
+    return {
+      pushTool(_tool: string, _summary: string) {},
+      push(_line: string) {},
+      async finish() {},
+    };
+  }
+
   let queue: string[] = [];
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   let pendingTool = "";
   let pendingLabel = "";
   let pendingFiles: string[] = [];
+
+  // normal mode: track progress message ID for edit-in-place
+  let progressMessageId: string | undefined;
+  let isEditing = false;
 
   const flushPending = () => {
     if (pendingFiles.length === 0) return;
@@ -55,8 +72,27 @@ export function createProgressSender(channel: ChatChannel, msgLimit: number) {
     if (queue.length === 0) return;
     const lines = queue.splice(0);
     const text = lines.join("\n").slice(0, msgLimit);
+
     try {
-      await channel.send(text);
+      if (verbosity === "normal" && progressMessageId) {
+        // normal mode: edit the existing progress message in place
+        if (isEditing) return;
+        isEditing = true;
+        try {
+          await channel.edit(progressMessageId, text);
+        } catch {
+          // edit failed (message deleted, etc.) — fallback to send
+          progressMessageId = await channel.send(text);
+        }
+        isEditing = false;
+      } else {
+        // verbose mode: always send new message
+        // normal mode first flush: send and cache message ID
+        const msgId = await channel.send(text);
+        if (verbosity === "normal" && !progressMessageId) {
+          progressMessageId = msgId;
+        }
+      }
     } catch {}
   };
 
@@ -114,9 +150,17 @@ export async function handleAgentRun(
   threadId: string,
   reply: ReplyHandler,
   msgLimit: number,
+  verbosity: VerbosityMode = "normal",
+  userMessageId?: string,
 ): Promise<void> {
   channel.sendTyping();
-  const progress = createProgressSender(channel, msgLimit);
+
+  // Emoji reaction: processing started
+  if (userMessageId) {
+    channel.react(userMessageId, "⏳").catch(() => {});
+  }
+
+  const progress = createProgressSender(channel, msgLimit, verbosity);
 
   let thinkingNotified = false;
   let textBuffer = "";
@@ -175,11 +219,23 @@ export async function handleAgentRun(
     for (let i = 0; i < chunks.length; i++) {
       await reply.sendResult(chunks[i], i === 0);
     }
+
+    // Emoji reaction: success
+    if (userMessageId) {
+      channel.removeReact(userMessageId, "⏳").catch(() => {});
+      channel.react(userMessageId, "✅").catch(() => {});
+    }
   } catch (err) {
     if (textTimer) clearTimeout(textTimer);
     await progress.finish();
     const errorMsg = err instanceof Error ? err.message : String(err);
     await reply.sendError(errorMsg);
+
+    // Emoji reaction: failure
+    if (userMessageId) {
+      channel.removeReact(userMessageId, "⏳").catch(() => {});
+      channel.react(userMessageId, "❌").catch(() => {});
+    }
   }
 }
 

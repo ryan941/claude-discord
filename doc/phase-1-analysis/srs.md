@@ -1,13 +1,13 @@
-# SRS 需求規格書 — Slack 平台擴充
+# SRS 需求規格書 — claude-discord Multi-Platform Bot
 
 ## 文件資訊
 
 | 項目 | 內容 |
 |------|------|
-| 專案名稱 | claude-discord Multi-Platform Extension (Slack) |
-| 版本 | v1.0 |
+| 專案名稱 | claude-discord Multi-Platform Bot |
+| 版本 | v1.1 |
 | 建立日期 | 2026-03-27 |
-| 最後修改 | 2026-03-27 |
+| 最後修改 | 2026-03-29 |
 | 狀態 | 草稿 |
 
 ---
@@ -20,12 +20,17 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 
 ### 1.2 目標
 
-- **主要目標**：新增 Slack bot 支援，與 Discord bot 功能對等
-- **次要目標**：重構為平台抽象架構（Adapter Pattern），使未來擴充其他平台更容易
+**v1.0（已完成）：**
+- 新增 Slack bot 支援，與 Discord bot 功能對等
+- 重構為平台抽象架構（Adapter Pattern），使未來擴充其他平台更容易
+
+**v1.1（本次）：**
+- **主要目標**：為 Discord 和 Slack 新增 Verbosity Modes（訊息顯示層級控制），解決進度訊息洗版問題
+- **次要目標**：改善 agent 執行期間的狀態回報體驗（emoji reaction）
 
 ### 1.3 範圍
 
-**包含在本次範圍內：**
+**v1.0 範圍（已完成）：**
 - 平台抽象層（Platform Adapter Interface）
 - Slack bot adapter（基於 @slack/bolt）
 - Discord bot adapter（重構現有 bot.ts）
@@ -33,15 +38,22 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - CLI 支援啟動指定平台或全部平台
 - init wizard 新增 Slack 設定流程
 
+**v1.1 範圍（本次新增）：**
+- 三段式 Verbosity Modes（quiet / normal / verbose）
+- 切換指令（`/quiet`、`/normal`、`/verbose`）
+- Edit-in-place 進度訊息（normal 模式）
+- Emoji reaction 狀態指示（⏳/✅/❌）
+- 適用於 Discord 和 Slack 雙平台
+
 **不在本次範圍內：**
-- Slack Slash Commands（使用 Slack 原生 slash command 註冊）——本次沿用訊息觸發模式
+- Slack Slash Commands（使用 Slack 原生 slash command 註冊）——沿用訊息觸發模式
 - Slack interactive components（buttons、modals）
 - 其他平台（Teams、Telegram 等）
-- Slack workspace 自動加入（需手動安裝 bot）
+- Per-thread verbosity override（未來可擴充）
 
 ### 1.4 參考系統
 
-- 現有 claude-discord bot（v1.0.4）作為功能基準線
+- 現有 claude-discord bot（v1.1.0）作為功能基準線
 
 ---
 
@@ -148,6 +160,71 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
   1. **Given** 執行 `claude-discord init`，**When** 進入設定流程，**Then** 除了 Discord 設定外，還詢問 Slack Bot Token 和 App Token
   2. **Given** 使用者只想設定 Slack（跳過 Discord），**When** Discord token 留空，**Then** 只寫入 Slack 相關設定
 
+### 3.5 Verbosity Modes（v1.1 新增）
+
+#### US-010：三段式 Verbosity 切換
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望能控制 bot 顯示多少進度資訊，以便在不同情境下獲得最適合的體驗
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** 頻道已綁定到專案，**When** 使用者發送 `/quiet`，**Then** bot 回覆確認已切換到 quiet 模式，後續該頻道的 agent 執行只顯示最終回覆
+  2. **Given** 頻道已綁定到專案，**When** 使用者發送 `/normal`，**Then** bot 回覆確認已切換到 normal 模式（預設值）
+  3. **Given** 頻道已綁定到專案，**When** 使用者發送 `/verbose`，**Then** bot 回覆確認已切換到 verbose 模式，後續該頻道的 agent 執行顯示每個工具呼叫的獨立訊息（與 v1.1.0 行為一致）
+  4. **Given** 頻道尚未設定 verbosity，**When** agent 執行，**Then** 預設使用 normal 模式
+  5. **Given** 頻道未綁定到任何專案，**When** 使用者發送 `/quiet`、`/normal`、`/verbose`，**Then** bot 不回應（與其他 admin 指令行為一致）
+- **備註**：Verbosity 設定以頻道為單位（per-channel），存放在與 channelProjects 相同的 runtime Map 中。切換指令為 admin 指令，不在 thread 中運作
+
+#### US-011：Quiet 模式 — 靜默執行
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望在 quiet 模式下只看到最終回覆，不被中間進度訊息打擾
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** 頻道設為 quiet 模式，**When** agent 執行期間使用工具（Read、Edit、Bash 等），**Then** thread 中不發送任何進度訊息
+  2. **Given** 頻道設為 quiet 模式，**When** agent 完成執行，**Then** 在 thread 中發送最終回覆（與其他模式相同）
+  3. **Given** 頻道設為 quiet 模式，**When** agent 執行出錯，**Then** 在 thread 中發送錯誤訊息（錯誤永遠顯示，不受模式影響）
+- **備註**：quiet 模式適合不需要看過程、只關心結果的場景。typing indicator 在 Discord 仍然顯示（讓使用者知道 bot 在工作），Slack 無 typing indicator 不受影響
+
+#### US-012：Normal 模式 — Edit-in-place 進度
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望在 normal 模式下透過一則持續更新的進度訊息了解 Claude 的工作狀態，而不是被大量獨立的進度訊息淹沒
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** 頻道設為 normal 模式，**When** agent 開始執行並產生第一個工具事件，**Then** bot 在 thread 中發送一則進度訊息
+  2. **Given** 進度訊息已發送，**When** agent 產生後續工具事件，**Then** bot 原地更新（edit）該則進度訊息的內容，而非發送新訊息
+  3. **Given** 進度訊息持續更新中，**Then** 進度訊息的內容反映當前正在執行的工具及其摘要（例如：`⏳ Reading 3 files...\n  config.ts\n  bot.ts\n  agent.ts`）
+  4. **Given** agent 完成執行，**When** 最終結果發送後，**Then** 進度訊息保留在 thread 中（不刪除），作為執行過程的簡要紀錄
+  5. **Given** agent 執行期間，**Then** 進度訊息的更新頻率遵循現有 debounce 機制（1.5s），不因 edit-in-place 而改變節奏
+- **備註**：
+  - Discord：使用 `Message.edit()` API 更新訊息
+  - Slack：使用 `chat.update` API 更新訊息（需要訊息的 `ts` 作為識別）
+  - Slack `chat.update` 與 `chat.postMessage` 共用相同的 rate limit tier，現有 1.5s debounce 已足夠
+  - 進度訊息只保留最近的工具活動摘要（非累積全部歷史），避免訊息過長
+
+#### US-013：Verbose 模式 — 完整進度
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望在 verbose 模式下看到每個工具呼叫的獨立訊息，以便詳細追蹤 Claude 的執行過程
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** 頻道設為 verbose 模式，**When** agent 執行，**Then** 行為與 v1.1.0 完全一致（每次 progress flush 發送新訊息）
+  2. **Given** 頻道設為 verbose 模式，**Then** 現有的 debounce 合併邏輯仍然生效（同類型連續工具事件仍會合併）
+- **備註**：verbose 模式是 v1.1.0 的現有行為，不需修改 progress 邏輯，只需在 handleAgentRun 中 bypass edit-in-place 即可
+
+#### US-014：Emoji Reaction 狀態指示
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望透過 emoji reaction 快速判斷 Claude 是否在處理我的訊息、是否已完成，而不需要看 thread 內容
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** 使用者在已綁定的頻道中發送訊息（觸發 agent），**When** agent 開始執行，**Then** bot 在使用者的訊息上加上 ⏳ reaction
+  2. **Given** agent 正在執行（訊息已有 ⏳ reaction），**When** agent 成功完成，**Then** bot 移除 ⏳ reaction 並加上 ✅ reaction
+  3. **Given** agent 正在執行（訊息已有 ⏳ reaction），**When** agent 執行出錯，**Then** bot 移除 ⏳ reaction 並加上 ❌ reaction
+  4. **Given** 任何 verbosity 模式（quiet / normal / verbose），**Then** emoji reaction 行為一致（不受 verbosity 模式影響）
+- **備註**：
+  - Discord：使用 `Message.react(emoji)` 加 reaction，`MessageReaction.remove()` 移除 reaction
+  - Slack：使用 `reactions.add` 加 reaction，`reactions.remove` 移除 reaction
+  - Slack 需要額外的 bot scope：`reactions:write`
+  - Emoji reaction 是獨立於 verbosity 的功能，在所有模式下都運作
+  - 如果 reaction API 呼叫失敗（例如權限不足），靜默忽略，不影響 agent 執行
+
 ---
 
 ## 4. 視覺體驗層級評估
@@ -162,6 +239,8 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 ### 5.1 效能需求
 - 訊息處理延遲：< 1s（從收到訊息到開始 Claude Code 執行）
 - 進度回報延遲：debounce 1.5s（與 Discord 一致）
+- Edit-in-place 更新延遲：遵循同一 debounce 週期（1.5s），不額外增加延遲
+- Emoji reaction 延遲：< 500ms（agent 開始後立即加 ⏳）
 
 ### 5.2 安全性需求
 - Bot token 存放在 ~/.claude-discord/.env，不進 git
@@ -174,7 +253,7 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 
 ### 5.4 其他
 - Slack 訊息長度上限：40,000 字元（需 split 機制但閾值不同）
-- Slack rate limiting：Tier 1 API（約 1 req/s），進度回報需考慮 rate limit
+- Slack rate limiting：`chat.postMessage` 和 `chat.update` 共用 Tier 4 special（~1 msg/s per channel）。現有 1.5s debounce 已滿足此限制。`reactions.add`/`reactions.remove` 為 Tier 2（~20/min），每次 agent 執行最多 3 次呼叫（add ⏳ → remove ⏳ → add ✅/❌），遠低於限制
 
 ---
 
@@ -208,6 +287,30 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 5. 每個 adapter 獨立處理自己的事件迴圈
 6. 共用：agent.ts（Claude Code 執行）、skills.ts（skill 系統）
 
+### 6.3 Verbosity Modes 訊息處理流程（v1.1 新增）
+
+**Verbosity 切換流程：**
+1. 使用者在頻道（非 thread）中發送 `/quiet`、`/normal` 或 `/verbose`
+2. Bot 檢查頻道是否已綁定到專案 → 未綁定：忽略
+3. 更新該頻道的 verbosity 設定（runtime Map）
+4. 回覆確認訊息（例如：`Verbosity set to **normal**`）
+
+**Agent 執行流程（依 verbosity 分支）：**
+1. 使用者發送訊息 → agent 開始執行
+2. Bot 在使用者訊息上加 ⏳ reaction（所有模式）
+3. 查詢該頻道的 verbosity 設定（預設 normal）
+4. 依模式分支：
+   - **quiet**：不建立 progressSender，不發送任何進度。直接等待 agent 完成
+   - **normal**：建立 progressSender，第一次 flush 時 `send()` 一則進度訊息並快取 message reference；後續 flush 使用 `edit()` 原地更新該訊息
+   - **verbose**：使用現有 progressSender 邏輯（每次 flush 都 `send()` 新訊息）
+5. Agent 完成 → 發送最終回覆
+6. 移除 ⏳ reaction → 加上 ✅ reaction（成功）或 ❌ reaction（失敗）
+
+**異常流程：**
+- 若 edit/update API 呼叫失敗（例如訊息已刪除）→ fallback 為 send 新訊息
+- 若 reaction API 呼叫失敗（例如缺少 scope）→ 靜默忽略，不影響 agent 執行
+- 若 agent 在 edit-in-place 更新中途出錯 → 照常發送錯誤訊息 + ❌ reaction
+
 ---
 
 ## 7. 假設與限制
@@ -221,6 +324,9 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - Slack 建立頻道需要 `channels:manage` scope
 - Slack Socket Mode 需要 App-Level Token（xapp-）
 - Slack bot 無法加入私人頻道除非被邀請
+- Slack `chat.update` 只能更新 bot 自己發送的訊息
+- Slack emoji reaction 需要 `reactions:write` scope（v1.1 新增需求）
+- Verbosity 設定為 runtime 狀態，bot 重啟後重置為 normal（不持久化）
 
 ### 7.3 依賴
 - @slack/bolt（Slack Bot Framework）
@@ -237,6 +343,9 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 | Bot Token (xoxb-) | Slack Bot User OAuth Token，用於 API 呼叫 |
 | App Token (xapp-) | Slack App-Level Token，用於 Socket Mode 連線 |
 | Thread Session | 一個 thread 對應一個 Claude Code session，保持上下文 |
+| Verbosity Mode | 訊息顯示層級。quiet = 只顯示結果；normal = edit-in-place 進度；verbose = 每個事件獨立訊息 |
+| Edit-in-place | 透過 API（Discord `Message.edit()` / Slack `chat.update`）原地更新已發送的訊息，而非發送新訊息 |
+| Emoji Reaction | 在使用者訊息上加的 emoji 標記，用於快速指示 agent 執行狀態（⏳/✅/❌） |
 
 ---
 
@@ -244,4 +353,5 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 
 | 版本 | 日期 | 變更內容 | 變更者 |
 |------|------|---------|--------|
-| v1.0 | 2026-03-27 | 初版建立 | SA |
+| v1.0 | 2026-03-27 | 初版建立（Slack 平台擴充） | SA |
+| v1.1 | 2026-03-29 | 新增 Verbosity Modes 功能需求（US-010~US-014） | SA |

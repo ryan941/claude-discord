@@ -4,7 +4,7 @@
 
 | 項目 | 內容 |
 |------|------|
-| 版本 | v2.0（合併版：模組設計 + 完整介面規格） |
+| 版本 | v3.0（v2.0 + Verbosity Modes） |
 | 建立日期 | 2026-03-27 |
 | 狀態 | 草稿 |
 
@@ -639,8 +639,485 @@ User: 只有 DISCORD_TOKEN，無 SLACK_*
 
 ---
 
+## 9. Verbosity Modes 設計（v3.0 新增）
+
+### 9.1 設計概覽
+
+Verbosity Modes 在現有的 progress sender 機制上加入分支邏輯，控制進度訊息的顯示策略。搭配 emoji reaction 在使用者訊息上指示 agent 執行狀態。
+
+**影響範圍**：
+
+| 檔案 | 變更類型 | 說明 |
+|------|---------|------|
+| platforms/types.ts | 修改 | ChatChannel 介面擴充 |
+| platforms/utils.ts | 修改 | createProgressSender + handleAgentRun 加入 verbosity 邏輯 |
+| platforms/discord/bot.ts | 修改 | wrapDiscordChannel 擴充 + verbosity 指令 + reaction |
+| platforms/slack/bot.ts | 修改 | chatChannel 擴充 + verbosity 指令 + reaction |
+| agent.ts | **不動** | — |
+| skills.ts | **不動** | — |
+| config.ts | **不動** | — |
+
+### 9.2 types.ts 介面擴充
+
+```typescript
+// --- 新增 ---
+
+export type VerbosityMode = "quiet" | "normal" | "verbose";
+
+// --- 修改 ChatChannel ---
+
+export interface ChatChannel {
+  /** 發送訊息，回傳 message ID（用於後續 edit/react） */
+  send(text: string): Promise<string | undefined>;
+
+  /** 顯示 typing indicator */
+  sendTyping(): void;
+
+  /** 原地更新已發送的訊息 */
+  edit(messageId: string, text: string): Promise<void>;
+
+  /** 在指定訊息上加 emoji reaction */
+  react(messageId: string, emoji: string): Promise<void>;
+
+  /** 移除指定訊息上的 emoji reaction */
+  removeReact(messageId: string, emoji: string): Promise<void>;
+}
+
+// --- ReplyHandler 不變 ---
+
+export interface ReplyHandler {
+  sendResult(chunk: string, isFirst: boolean): Promise<void>;
+  sendError(errorMsg: string): Promise<void>;
+}
+
+// --- PlatformAdapter 不變 ---
+```
+
+**設計決策**：
+- `send()` 回傳 `string | undefined`：Discord 和 Slack 都能從 send 回應中取得 message ID。回傳 `undefined` 表示取得失敗（不影響流程）
+- `edit()`/`react()`/`removeReact()` 為必要方法（非 optional）：兩平台都支援，實作中用 try-catch 靜默處理失敗
+- 不新增 `supportsEditing()` 等 capability flag：當前兩個平台都完整支援，不需要
+
+### 9.3 createProgressSender 改造
+
+**現有簽章**：
+```typescript
+function createProgressSender(channel: ChatChannel, msgLimit: number)
+```
+
+**新簽章**：
+```typescript
+function createProgressSender(
+  channel: ChatChannel,
+  msgLimit: number,
+  verbosity: VerbosityMode = "normal"
+)
+```
+
+**三種模式的分支邏輯**：
+
+```typescript
+export function createProgressSender(
+  channel: ChatChannel,
+  msgLimit: number,
+  verbosity: VerbosityMode = "normal"
+) {
+  // --- quiet 模式：所有操作為 noop ---
+  if (verbosity === "quiet") {
+    return {
+      pushTool(_tool: string, _summary: string) {},
+      push(_line: string) {},
+      async finish() {},
+    };
+  }
+
+  // --- verbose 模式：現有邏輯不變（每次 flush 都 send 新訊息）---
+  // --- normal 模式：第一次 send，後續 edit ---
+
+  let queue: string[] = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pendingTool = "";
+  let pendingLabel = "";
+  let pendingFiles: string[] = [];
+
+  // normal 模式專用：追蹤進度訊息 ID
+  let progressMessageId: string | undefined;
+  let isEditing = false;  // 簡單 lock 防止併發 edit
+
+  const flushPending = () => {
+    // ... 與現有邏輯完全一致 ...
+  };
+
+  const flush = async () => {
+    flushPending();
+    if (queue.length === 0) return;
+    const lines = queue.splice(0);
+    const text = lines.join("\n").slice(0, msgLimit);
+
+    try {
+      if (verbosity === "normal" && progressMessageId) {
+        // normal 模式：edit-in-place
+        if (isEditing) return;  // 正在更新中，跳過（下次 debounce 會帶最新內容）
+        isEditing = true;
+        try {
+          await channel.edit(progressMessageId, text);
+        } catch {
+          // edit 失敗（訊息已刪除等），fallback 為 send
+          progressMessageId = await channel.send(text);
+        }
+        isEditing = false;
+      } else {
+        // verbose 模式 或 normal 模式的第一次：send 新訊息
+        const msgId = await channel.send(text);
+        if (verbosity === "normal" && !progressMessageId) {
+          progressMessageId = msgId;  // 快取第一則進度訊息的 ID
+        }
+      }
+    } catch {}
+  };
+
+  return {
+    pushTool(tool: string, summary: string) {
+      // ... 與現有邏輯完全一致 ...
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { flush(); }, 1500);
+    },
+    push(line: string) {
+      // ... 與現有邏輯完全一致 ...
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { flush(); }, 1500);
+    },
+    async finish() {
+      if (timer) clearTimeout(timer);
+      await flush();
+    },
+  };
+}
+```
+
+**關鍵行為差異**：
+
+| 行為 | quiet | normal | verbose |
+|------|-------|--------|---------|
+| pushTool / push | noop | 推入 queue | 推入 queue |
+| 第一次 flush | — | `send()` + 快取 msgId | `send()` |
+| 後續 flush | — | `edit(msgId)` | `send()`（新訊息）|
+| edit 失敗 | — | fallback `send()` | N/A |
+| finish | noop | 最後一次 flush | 最後一次 flush |
+
+### 9.4 handleAgentRun 改造
+
+**現有簽章**：
+```typescript
+async function handleAgentRun(
+  channel: ChatChannel,
+  prompt: string,
+  cwd: string,
+  threadId: string,
+  reply: ReplyHandler,
+  msgLimit: number,
+): Promise<void>
+```
+
+**新簽章**：
+```typescript
+async function handleAgentRun(
+  channel: ChatChannel,
+  prompt: string,
+  cwd: string,
+  threadId: string,
+  reply: ReplyHandler,
+  msgLimit: number,
+  verbosity: VerbosityMode = "normal",
+  userMessageId?: string,  // 使用者訊息 ID，用於 reaction
+): Promise<void>
+```
+
+**新增邏輯**：
+
+```typescript
+export async function handleAgentRun(
+  channel: ChatChannel,
+  prompt: string,
+  cwd: string,
+  threadId: string,
+  reply: ReplyHandler,
+  msgLimit: number,
+  verbosity: VerbosityMode = "normal",
+  userMessageId?: string,
+): Promise<void> {
+  channel.sendTyping();
+
+  // --- Emoji reaction：開始處理 ---
+  if (userMessageId) {
+    channel.react(userMessageId, "⏳").catch(() => {});
+  }
+
+  // --- 傳入 verbosity 給 progressSender ---
+  const progress = createProgressSender(channel, msgLimit, verbosity);
+
+  // ... callbacks 邏輯與現有一致（不動）...
+  // ... quiet 模式下 progressSender 自動 noop，callbacks 不需判斷 ...
+
+  try {
+    const result = await runAgent(prompt, cwd, threadId, callbacks);
+
+    // ... 現有的 flush + result 發送邏輯 ...
+
+    // --- Emoji reaction：完成 ---
+    if (userMessageId) {
+      channel.removeReact(userMessageId, "⏳").catch(() => {});
+      channel.react(userMessageId, "✅").catch(() => {});
+    }
+  } catch (err) {
+    // ... 現有的 error 處理 ...
+
+    // --- Emoji reaction：失敗 ---
+    if (userMessageId) {
+      channel.removeReact(userMessageId, "⏳").catch(() => {});
+      channel.react(userMessageId, "❌").catch(() => {});
+    }
+  }
+}
+```
+
+**設計要點**：
+- `userMessageId` 為 optional：向後相容，不傳就沒有 reaction
+- reaction 呼叫全部用 `.catch(() => {})`：失敗靜默忽略
+- callbacks 不需要感知 verbosity：progressSender 在 quiet 模式下自動 noop
+- onText 的中間文字 flush 行為在三種模式下一致（都會 send 到 thread）——只有 progress 訊息受 verbosity 影響
+
+### 9.5 Discord Adapter 改動
+
+#### 9.5.1 Verbosity 狀態管理
+
+在 `createDiscordAdapter` 函式內新增：
+
+```typescript
+const channelVerbosity = new Map<string, VerbosityMode>();
+
+function getVerbosity(channelId: string): VerbosityMode {
+  return channelVerbosity.get(channelId) ?? "normal";
+}
+```
+
+#### 9.5.2 wrapDiscordChannel 擴充
+
+```typescript
+function wrapDiscordChannel(
+  ch: TextChannel | ThreadChannel
+): { channel: ChatChannel; stop: () => void } {
+  let alive = true;
+
+  const tick = () => {
+    if (!alive) return;
+    ch.sendTyping().catch(() => {});
+    setTimeout(tick, 8000);
+  };
+
+  return {
+    channel: {
+      send: async (text) => {
+        const msg = await ch.send(text);
+        return msg.id;  // 回傳 Discord message ID
+      },
+      sendTyping: () => { alive = true; tick(); },
+      edit: async (messageId, text) => {
+        const msg = await ch.messages.fetch(messageId);
+        await msg.edit(text);
+      },
+      react: async (messageId, emoji) => {
+        const msg = await ch.messages.fetch(messageId);
+        await msg.react(emoji);
+      },
+      removeReact: async (messageId, emoji) => {
+        const msg = await ch.messages.fetch(messageId);
+        const reaction = msg.reactions.cache.find(
+          (r) => r.emoji.name === emoji
+        );
+        if (reaction) await reaction.users.remove(ch.client.user?.id);
+      },
+    },
+    stop: () => { alive = false; },
+  };
+}
+```
+
+#### 9.5.3 Verbosity 指令解析
+
+在 `messageCreate` handler 的 admin commands 區塊新增（在 `/skills` 之後）：
+
+```typescript
+// --- Admin command: /quiet, /normal, /verbose ---
+const verbosityCommands: Record<string, VerbosityMode> = {
+  "/quiet": "quiet",
+  "/normal": "normal",
+  "/verbose": "verbose",
+};
+if (message.content in verbosityCommands && !message.channel.isThread()) {
+  const channelId = message.channel.id;
+  if (!resolveProjectCwd(channelId, config)) return;  // 未綁定就忽略
+  const mode = verbosityCommands[message.content];
+  channelVerbosity.set(channelId, mode);
+  await message.reply(`Verbosity set to **${mode}**`);
+  return;
+}
+```
+
+#### 9.5.4 handleAgentRun 呼叫更新
+
+**頻道訊息（建立 thread）**：
+```typescript
+// 現有
+await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT);
+
+// 改為
+const verbosity = getVerbosity(message.channel.id);
+await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT, verbosity, message.id);
+```
+
+**Thread 訊息（續接 session）**：
+```typescript
+// 現有
+await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT);
+
+// 改為
+const verbosity = getVerbosity(parentId);
+await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT, verbosity, message.id);
+```
+
+### 9.6 Slack Adapter 改動
+
+#### 9.6.1 Verbosity 狀態管理
+
+在 `createSlackAdapter` 函式內新增：
+
+```typescript
+const channelVerbosity = new Map<string, VerbosityMode>();
+
+function getVerbosity(channelId: string): VerbosityMode {
+  return channelVerbosity.get(channelId) ?? "normal";
+}
+```
+
+#### 9.6.2 chatChannel 擴充
+
+```typescript
+const chatChannel: ChatChannel = {
+  send: async (t) => {
+    const res = await client.chat.postMessage({
+      channel: channelId,
+      text: t,
+      thread_ts: replyTs,
+    });
+    return res.ts;  // 回傳 Slack message timestamp 作為 ID
+  },
+  sendTyping: () => {},
+  edit: async (messageId, text) => {
+    await client.chat.update({
+      channel: channelId,
+      ts: messageId,
+      text: text,
+    });
+  },
+  react: async (messageId, emoji) => {
+    // Slack 使用文字名稱而非 Unicode
+    const slackName = EMOJI_MAP[emoji] || emoji;
+    await client.reactions.add({
+      channel: channelId,
+      timestamp: messageId,
+      name: slackName,
+    });
+  },
+  removeReact: async (messageId, emoji) => {
+    const slackName = EMOJI_MAP[emoji] || emoji;
+    await client.reactions.remove({
+      channel: channelId,
+      timestamp: messageId,
+      name: slackName,
+    });
+  },
+};
+```
+
+#### 9.6.3 Emoji 名稱映射
+
+Slack API 使用文字名稱，Discord 使用 Unicode。映射表放在 Slack adapter 內部：
+
+```typescript
+const EMOJI_MAP: Record<string, string> = {
+  "⏳": "hourglass_flowing_sand",
+  "✅": "white_check_mark",
+  "❌": "x",
+};
+```
+
+Discord 不需要映射（直接支援 Unicode emoji）。
+
+#### 9.6.4 Verbosity 指令解析
+
+在 admin commands 區塊新增（在 `/skills` 之後）：
+
+```typescript
+const verbosityCommands: Record<string, VerbosityMode> = {
+  "/quiet": "quiet",
+  "/normal": "normal",
+  "/verbose": "verbose",
+};
+if (text in verbosityCommands) {
+  if (!config.channelProjects.get(channelId)) return;  // 未綁定就忽略
+  const mode = verbosityCommands[text];
+  channelVerbosity.set(channelId, mode);
+  await client.chat.postMessage({
+    channel: channelId,
+    text: `Verbosity set to *${mode}*`,
+    thread_ts: messageTs,
+  });
+  return;
+}
+```
+
+#### 9.6.5 handleAgentRun 呼叫更新
+
+```typescript
+// 現有
+await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT);
+
+// 改為
+const verbosity = getVerbosity(channelId);
+await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT, verbosity, messageTs);
+```
+
+### 9.7 向後相容驗證
+
+```
+場景 1：未下任何 verbosity 指令
+  → channelVerbosity.get(channelId) = undefined
+  → getVerbosity() 回傳 "normal"
+  → createProgressSender 走 normal 路徑（edit-in-place）
+  → ⚠️ 注意：v1.1.0 的行為是 verbose（每次 send 新訊息）
+  → v1.2.0 的預設變更為 normal（edit-in-place）——這是有意的 UX 改進
+
+場景 2：下了 /verbose 指令
+  → channelVerbosity.set(channelId, "verbose")
+  → createProgressSender 走 verbose 路徑
+  → 行為與 v1.1.0 完全一致 ✅
+
+場景 3：ChatChannel.send() 回傳值變更
+  → 現有呼叫端（handleAgentRun 中的 flushText）不使用回傳值
+  → 不影響現有邏輯 ✅
+
+場景 4：Slack 缺少 reactions:write scope
+  → react/removeReact 呼叫失敗
+  → .catch(() => {}) 靜默忽略
+  → agent 正常執行，只是沒有 emoji 指示 ✅
+```
+
+---
+
 ## 變更記錄
 
 | 版本 | 日期 | 變更內容 | 變更者 |
 |------|------|---------|--------|
 | v2.0 | 2026-03-27 | 合併版初版建立（S 級專案，無 UI/DB，一次產出完整設計） | SD |
+| v3.0 | 2026-03-29 | 新增 Verbosity Modes 設計（Section 9） | SD |
