@@ -3,9 +3,9 @@
 ## 專案資訊
 - **專案名稱**：claude-discord
 - **建立日期**：2026-03-27
-- **目前狀態**：PHASE_5_DELIVERY — Step 5.1 Doc Writer
+- **目前狀態**：DONE — v1.2.0 已交付
 - **阻塞事項**：無
-- **下一步動作**：Doc Writer → Git-Ops commit → Skill Evolver
+- **下一步動作**：無（等待 git push 確認）
 
 ## 已完成交付物
 - ✅ SRS v1.0（Slack 擴充）— `doc/phase-1-analysis/srs.md` — 2026-03-27

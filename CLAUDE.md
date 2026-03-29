@@ -6,11 +6,10 @@
 ## 當前狀態
 
 - **版本**：v1.1.0（已發佈）
-- **進行中功能**：Verbosity Modes（訊息顯示層級控制）
-- **Phase**：PHASE_1_ANALYSIS（10%）
-- **當前 Step**：Step 1.1 — SA 需求分析（Verbosity Modes）
+- **最新功能**：Verbosity Modes（v1.2.0，已交付）
+- **Phase**：DONE
 - **阻塞事項**：無
-- **下一步**：SA 產出 SRS 增量版 → Architect 可行性評估
+- **下一步**：git push（待確認）
 
 ## 專案概述
 
@@ -46,7 +45,11 @@
 - ✅ SDD v2.0（Slack 擴充）— `doc/phase-2-design/sdd.md`
 - ✅ Release Notes v1.1.0 — `doc/phase-5-delivery/release-notes.md`
 - ✅ v1.1.0 已發佈
-- ⏳ SRS v1.1（Verbosity Modes）— 進行中
+- ✅ SRS v1.1（Verbosity Modes）— `doc/phase-1-analysis/srs.md`
+- ✅ SDD v3.0（Verbosity Modes）— `doc/phase-2-design/sdd.md`
+- ✅ 測試報告 v1.1 — `doc/phase-4-qa/test-report.md`
+- ✅ Release Notes v1.2.0 — `doc/phase-5-delivery/release-notes.md`
+- ✅ v1.2.0 已 commit（`4b87e5d`，待 push）
 
 ## 快速指令
 
