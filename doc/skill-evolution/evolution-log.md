@@ -68,3 +68,26 @@
 
 ### Obsidian 知識沉澱
 - ✅ `30-Notes/three-tier-verbosity-pattern-for-bots.md` — 三段式 verbosity 作為可複用的 bot/CLI UX 模式
+
+---
+
+## v1.2 - 2026-03-29（claude-discord Interactive Permission Confirmation 後的回顧）
+
+### 專案摘要
+- **類型**：S 級 feature 擴充（canUseTool + Discord Buttons + Slack Block Kit）
+- **流程**：Phase 1~5 全走，S 級精簡
+- **結果**：✅ 完成，0 bug，build 零錯誤，QA 42/42 SDD 一致性通過
+
+### 觀察與改進建議
+
+**本次無 Skill 改進建議。** 連續兩個 feature 零退回、零 bug：
+- SA 需求清晰（5 US），Architect 一次通過
+- SD 設計完整，Callback Injection 模式乾淨
+- BE 一次 build 通過
+- QA 42 項全數通過
+
+### 正面觀察
+- **Callback Injection 模式**：讓 agent.ts 保持平台無關，同時支援平台特定的互動 UI——完美的依賴反轉
+- **Slack Promise 橋接**：pendingPermissions Map + app.action handler 是 event-driven → request-response 的經典橋接模式
+- **安全導向 fallback**：所有異常路徑都 deny 而非 allow，正確的安全預設值
+- **SDK 研究先行**：先查 SDK API 再討論方案，避免了設計階段的返工

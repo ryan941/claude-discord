@@ -7,9 +7,9 @@
 
 - **版本**：v1.1.0（已發佈）
 - **最新功能**：Interactive Permission Confirmation（v1.3.0）
-- **Phase**：PHASE_5_DELIVERY
+- **Phase**：DONE
 - **阻塞事項**：無
-- **下一步**：commit + Skill Evolver
+- **下一步**：git push（待確認）
 
 ## 專案概述
 
@@ -55,7 +55,7 @@
 - ✅ SDD v4.0（Interactive Permission）— `doc/phase-2-design/sdd.md`
 - ✅ 測試報告 v1.2 — `doc/phase-4-qa/test-report.md`
 - ✅ Release Notes v1.3.0 — `doc/phase-5-delivery/release-notes.md`
-- ⏳ v1.3.0 待 commit
+- ✅ v1.3.0 已 commit（`59d6e63`，待 push）
 
 ## 快速指令
 
