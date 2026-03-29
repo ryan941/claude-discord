@@ -6,10 +6,10 @@
 ## 當前狀態
 
 - **版本**：v1.1.0（已發佈）
-- **最新功能**：Verbosity Modes（v1.2.0，已交付）
-- **Phase**：DONE
+- **最新功能**：Interactive Permission Confirmation（v1.3.0）
+- **Phase**：PHASE_5_DELIVERY
 - **阻塞事項**：無
-- **下一步**：git push（待確認）
+- **下一步**：commit + Skill Evolver
 
 ## 專案概述
 
@@ -37,6 +37,7 @@
 | 2026-03-27 | 採用 Platform Adapter Pattern | 讓 Discord/Slack 共用 agent.ts + skills.ts，新平台只需實作 adapter |
 | 2026-03-27 | Slack 使用 Socket Mode | 無需公開 HTTP endpoint，適合本地開發和私人部署 |
 | 2026-03-29 | 採用三段式 Verbosity Modes | 平衡 Discord 訊息顯示的資訊量和整潔度（quiet/normal/verbose） |
+| 2026-03-29 | permissionMode: default + canUseTool | 讓 SDK 安全機制在 Discord/Slack 生效，與 terminal 一致 |
 
 ## 已完成交付物
 
@@ -50,6 +51,11 @@
 - ✅ 測試報告 v1.1 — `doc/phase-4-qa/test-report.md`
 - ✅ Release Notes v1.2.0 — `doc/phase-5-delivery/release-notes.md`
 - ✅ v1.2.0 已 commit（`4b87e5d`，待 push）
+- ✅ SRS v1.2（Interactive Permission）— `doc/phase-1-analysis/srs.md`
+- ✅ SDD v4.0（Interactive Permission）— `doc/phase-2-design/sdd.md`
+- ✅ 測試報告 v1.2 — `doc/phase-4-qa/test-report.md`
+- ✅ Release Notes v1.3.0 — `doc/phase-5-delivery/release-notes.md`
+- ⏳ v1.3.0 待 commit
 
 ## 快速指令
 

@@ -4,7 +4,7 @@
 
 | 項目 | 內容 |
 |------|------|
-| 版本 | v3.0（v2.0 + Verbosity Modes） |
+| 版本 | v4.0（v3.0 + Interactive Permission） |
 | 建立日期 | 2026-03-27 |
 | 狀態 | 草稿 |
 
@@ -1115,9 +1115,405 @@ await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMI
 
 ---
 
+## 10. Interactive Permission Confirmation 設計（v4.0 新增）
+
+### 10.1 設計概覽
+
+將 `permissionMode` 從 `bypassPermissions` 改為 `default`，搭配 `canUseTool` callback 讓 SDK 動態判斷需要權限的工具。當 SDK 觸發 `canUseTool` 時，在 Discord/Slack thread 中發送 Allow/Deny 按鈕，等待使用者回應。
+
+**資料流（Callback Injection）**：
+```
+Platform Adapter（建立 canUseTool 閉包，閉包捕獲平台 channel/client）
+    ↓ 傳遞
+handleAgentRun(..., permissionHandler)
+    ↓ 透傳
+runAgent(..., permissionHandler)
+    ↓ 傳給 SDK
+query({ options: { permissionMode: "default", canUseTool: permissionHandler } })
+    ↓ SDK 判斷需要權限時呼叫
+permissionHandler(toolName, input, options)
+    ↓ 閉包內部：發送按鈕 → 等待互動 → 回傳 allow/deny
+```
+
+**影響範圍**：
+
+| 檔案 | 變更類型 | 說明 |
+|------|---------|------|
+| platforms/types.ts | 新增 | PermissionHandler type |
+| agent.ts | 修改 | runAgent 新增 permissionHandler 參數、permissionMode 改為 "default"、export summarizeToolUse |
+| platforms/utils.ts | 修改 | handleAgentRun 新增 permissionHandler 透傳 |
+| platforms/discord/bot.ts | 新增 | createPermissionHandler 閉包（ActionRow + Button + awaitMessageComponent） |
+| platforms/slack/bot.ts | 新增 | pendingPermissions Map + app.action handler + createPermissionHandler 閉包（Block Kit） |
+| skills.ts | **不動** | — |
+| config.ts | **不動** | — |
+
+### 10.2 types.ts 新增
+
+```typescript
+/**
+ * Permission handler callback. Matches SDK's CanUseTool signature.
+ * Platform adapters create this as a closure capturing platform-specific objects.
+ */
+export type PermissionHandler = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options: {
+    signal: AbortSignal;
+    suggestions?: unknown[];
+    blockedPath?: string;
+    decisionReason?: string;
+    toolUseID: string;
+    agentID?: string;
+  },
+) => Promise<
+  | { behavior: "allow"; updatedInput?: Record<string, unknown> }
+  | { behavior: "deny"; message: string; interrupt?: boolean }
+>;
+```
+
+**設計決策**：定義自己的 type alias 而非直接 import SDK 的 `CanUseTool`，避免平台層直接依賴 SDK types。簽章完全對齊。
+
+### 10.3 agent.ts 改造
+
+**runAgent() 新簽章**：
+
+```typescript
+export async function runAgent(
+  prompt: string,
+  cwd: string,
+  threadId: string,
+  callbacks?: StreamCallbacks,
+  permissionHandler?: PermissionHandler,  // 新增
+): Promise<AgentResult>
+```
+
+**query() options 改動**：
+
+```typescript
+const stream = query({
+  prompt,
+  options: {
+    cwd,
+    resume: sessionId,
+    permissionMode: permissionHandler ? "default" : "bypassPermissions",
+    canUseTool: permissionHandler,  // 新增：有 handler 就傳，沒有就 undefined
+    systemPrompt: { /* 不變 */ },
+    settingSources: ["user", "project"],
+  },
+});
+```
+
+**設計決策**：
+- `permissionMode` 根據有無 `permissionHandler` 動態決定：有 handler → `"default"`（SDK 動態判斷），沒有 → `"bypassPermissions"`（向後相容）
+- 這讓 `runAgent()` 可以在沒有平台互動能力的場景（例如 unit test、CLI 直呼）下仍用 bypass 模式
+- `canUseTool: undefined` 對 SDK 等同於不傳，不影響行為
+
+**Export summarizeToolUse**：
+
+```typescript
+// 從 function 改為 export function，讓平台 adapter 的 canUseTool 閉包可以複用
+export function summarizeToolUse(toolName: string, input: Record<string, unknown>): string {
+  // ... 邏輯不變 ...
+}
+```
+
+### 10.4 utils.ts — handleAgentRun 改造
+
+**新簽章**（在 userMessageId 之後新增參數）：
+
+```typescript
+export async function handleAgentRun(
+  channel: ChatChannel,
+  prompt: string,
+  cwd: string,
+  threadId: string,
+  reply: ReplyHandler,
+  msgLimit: number,
+  verbosity: VerbosityMode = "normal",
+  userMessageId?: string,
+  permissionHandler?: PermissionHandler,  // 新增
+): Promise<void>
+```
+
+**runAgent 呼叫改動**：
+
+```typescript
+// 現有
+const result = await runAgent(prompt, cwd, threadId, callbacks);
+
+// 改為
+const result = await runAgent(prompt, cwd, threadId, callbacks, permissionHandler);
+```
+
+只透傳，不在 utils.ts 中做任何權限邏輯。
+
+### 10.5 Discord Adapter — Permission Handler
+
+在 `createDiscordAdapter` 內新增 factory function：
+
+```typescript
+import {
+  // ... 現有 imports ...
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+} from "discord.js";
+import { PermissionHandler } from "../types";
+import { summarizeToolUse } from "../../agent";
+
+function createDiscordPermissionHandler(
+  thread: ThreadChannel
+): PermissionHandler {
+  return async (toolName, input, options) => {
+    const summary = summarizeToolUse(toolName, input);
+    const reason = options.decisionReason ? `\nReason: ${options.decisionReason}` : "";
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`allow_${options.toolUseID}`)
+        .setLabel("Allow")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`deny_${options.toolUseID}`)
+        .setLabel("Deny")
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    const msg = await thread.send({
+      content: `🔒 **Permission Required**\nTool: **${toolName}**\n${summary}${reason}`,
+      components: [row],
+    });
+
+    try {
+      const interaction = await msg.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        time: 60_000,
+      });
+
+      if (interaction.customId.startsWith("allow")) {
+        await interaction.update({
+          content: `✅ **Allowed:** ${toolName} — ${summary}`,
+          components: [],
+        });
+        return { behavior: "allow" as const };
+      } else {
+        await interaction.update({
+          content: `❌ **Denied:** ${toolName} — ${summary}`,
+          components: [],
+        });
+        return { behavior: "deny" as const, message: "User denied via Discord" };
+      }
+    } catch {
+      // Timeout or error — update message and deny
+      await msg.edit({
+        content: `⏰ **Timed out:** ${toolName} — ${summary}`,
+        components: [],
+      }).catch(() => {});
+      return { behavior: "deny" as const, message: "Permission timed out (60s)" };
+    }
+  };
+}
+```
+
+**handleAgentRun 呼叫更新**：
+
+```typescript
+// 頻道訊息（建立 thread）
+const verbosity = getVerbosity(message.channel.id);
+const permHandler = createDiscordPermissionHandler(thread);
+await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT, verbosity, message.id, permHandler);
+
+// Thread 訊息（續接 session）
+const verbosity = getVerbosity(parentId);
+const permHandler = createDiscordPermissionHandler(threadChannel);
+await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT, verbosity, message.id, permHandler);
+```
+
+### 10.6 Slack Adapter — Permission Handler
+
+**核心挑戰**：Slack 的 `app.action()` 是 event-driven 全域 handler，不是 request-response。需要 Promise 橋接。
+
+**Step 1：pendingPermissions Map（在 createSlackAdapter 函式頂層）**
+
+```typescript
+const pendingPermissions = new Map<string, (allowed: boolean) => void>();
+```
+
+**Step 2：全域 action handler（在 createSlackAdapter 中，app.event 之前註冊一次）**
+
+```typescript
+app.action(/^(perm_allow|perm_deny)_/, async ({ action, ack, client, body }) => {
+  await ack();
+  const act = action as { action_id: string };
+  const parts = act.action_id.split("_");
+  // action_id format: perm_allow_{uniqueId} or perm_deny_{uniqueId}
+  const allowed = parts[1] === "allow";
+  const uniqueId = parts.slice(2).join("_");
+
+  const resolve = pendingPermissions.get(uniqueId);
+  if (resolve) {
+    resolve(allowed);
+    pendingPermissions.delete(uniqueId);
+  }
+
+  // Update message to remove buttons
+  const msgBody = body as { container?: { channel_id?: string; message_ts?: string } };
+  const channelId = msgBody.container?.channel_id;
+  const messageTs = msgBody.container?.message_ts;
+  if (channelId && messageTs) {
+    const status = allowed ? "✅ *Allowed*" : "❌ *Denied*";
+    await client.chat.update({
+      channel: channelId,
+      ts: messageTs,
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: status } }],
+      text: status,
+    }).catch(() => {});
+  }
+});
+```
+
+**Step 3：createSlackPermissionHandler factory**
+
+```typescript
+function createSlackPermissionHandler(
+  client: any,
+  channelId: string,
+  replyTs: string,
+): PermissionHandler {
+  return async (toolName, input, options) => {
+    const summary = summarizeToolUse(toolName, input);
+    const reason = options.decisionReason ? `\nReason: ${options.decisionReason}` : "";
+    const uniqueId = `${Date.now()}_${options.toolUseID}`;
+
+    await client.chat.postMessage({
+      channel: channelId,
+      thread_ts: replyTs,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `🔒 *Permission Required*\nTool: *${toolName}*\n${summary}${reason}`,
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "✅ Allow" },
+              action_id: `perm_allow_${uniqueId}`,
+              style: "primary",
+            },
+            {
+              type: "button",
+              text: { type: "plain_text", text: "❌ Deny" },
+              action_id: `perm_deny_${uniqueId}`,
+              style: "danger",
+            },
+          ],
+        },
+      ],
+      text: `🔒 Permission Required: ${toolName}`,
+    });
+
+    try {
+      const allowed = await Promise.race<boolean>([
+        new Promise<boolean>((resolve) => {
+          pendingPermissions.set(uniqueId, resolve);
+        }),
+        new Promise<boolean>((_, reject) => {
+          setTimeout(() => reject(new Error("timeout")), 60_000);
+        }),
+      ]);
+
+      return allowed
+        ? { behavior: "allow" as const }
+        : { behavior: "deny" as const, message: "User denied via Slack" };
+    } catch {
+      // Timeout — clean up and deny
+      pendingPermissions.delete(uniqueId);
+      return { behavior: "deny" as const, message: "Permission timed out (60s)" };
+    }
+  };
+}
+```
+
+**handleAgentRun 呼叫更新**：
+
+```typescript
+// 現有
+const verbosity = getVerbosity(channelId);
+await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT, verbosity, messageTs);
+
+// 改為
+const verbosity = getVerbosity(channelId);
+const permHandler = createSlackPermissionHandler(client, channelId, replyTs);
+await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT, verbosity, messageTs, permHandler);
+```
+
+### 10.7 確認訊息格式
+
+**Discord**（Markdown）：
+```
+🔒 **Permission Required**
+Tool: **Bash**
+Running `git push origin main`
+Reason: This command may modify remote repository
+
+[✅ Allow]  [❌ Deny]
+```
+
+**Slack**（Mrkdwn, Block Kit）：
+```
+🔒 *Permission Required*
+Tool: *Bash*
+Running `git push origin main`
+Reason: This command may modify remote repository
+
+[✅ Allow]  [❌ Deny]
+```
+
+**按鈕點擊後**：
+- Allow → `✅ **Allowed:** Bash — Running \`git push origin main\``
+- Deny → `❌ **Denied:** Bash — Running \`git push origin main\``
+- Timeout → `⏰ **Timed out:** Bash — Running \`git push origin main\``
+
+### 10.8 向後相容驗證
+
+```
+場景 1：不傳 permissionHandler（例如 unit test 直呼 runAgent）
+  → permissionHandler = undefined
+  → permissionMode = "bypassPermissions"（conditional）
+  → 行為與 v1.2.0 完全一致 ✅
+
+場景 2：正常 Discord/Slack 使用（傳 permissionHandler）
+  → permissionMode = "default"
+  → SDK 判斷低風險工具（Read, Glob）→ 不呼叫 canUseTool，直接執行
+  → SDK 判斷高風險工具（Bash git push）→ 呼叫 canUseTool → 按鈕確認
+  → 與 terminal Claude Code 行為一致 ✅
+
+場景 3：超時 deny 後 session resume
+  → canUseTool 回傳 deny → agent 收到拒絕 → 依 system prompt 停止
+  → 使用者在 thread 回覆 → resume: sessionId → agent 重試 → 新一輪 canUseTool
+  → 這次使用者在線 → Allow → 執行 ✅
+
+場景 4：Slack action handler 收到未知 action_id
+  → pendingPermissions.get() = undefined → 忽略 ✅
+
+場景 5：多個 permission request 同時（agent 快速連續觸發）
+  → 每個 request 有唯一 uniqueId（timestamp + toolUseID）
+  → pendingPermissions Map 用 uniqueId 隔離
+  → 互不干擾 ✅
+```
+
+---
+
 ## 變更記錄
 
 | 版本 | 日期 | 變更內容 | 變更者 |
 |------|------|---------|--------|
 | v2.0 | 2026-03-27 | 合併版初版建立（S 級專案，無 UI/DB，一次產出完整設計） | SD |
 | v3.0 | 2026-03-29 | 新增 Verbosity Modes 設計（Section 9） | SD |
+| v4.0 | 2026-03-29 | 新增 Interactive Permission Confirmation 設計（Section 10） | SD |

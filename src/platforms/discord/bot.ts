@@ -1,5 +1,9 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
+  ComponentType,
   GatewayIntentBits,
   Message,
   MessageType,
@@ -9,9 +13,10 @@ import {
   ThreadAutoArchiveDuration,
 } from "discord.js";
 import { DiscordConfig } from "../../config";
-import { ChatChannel, PlatformAdapter, ReplyHandler, VerbosityMode } from "../types";
+import { ChatChannel, PlatformAdapter, ReplyHandler, VerbosityMode, PermissionHandler } from "../types";
 import { handleAgentRun, splitMessage } from "../utils";
 import { resolveSkill, buildSkillPrompt, listSkills, preloadSkills } from "../../skills";
+import { summarizeToolUse } from "../../agent";
 import { syncProjects, startWatcher } from "./watcher";
 
 const MSG_LIMIT = 2000;
@@ -47,6 +52,56 @@ function wrapDiscordChannel(ch: TextChannel | ThreadChannel): { channel: ChatCha
       },
     },
     stop: () => { alive = false; },
+  };
+}
+
+function createDiscordPermissionHandler(thread: ThreadChannel): PermissionHandler {
+  return async (toolName, input, options) => {
+    const summary = summarizeToolUse(toolName, input);
+    const reason = options.decisionReason ? `\nReason: ${options.decisionReason}` : "";
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`allow_${options.toolUseID}`)
+        .setLabel("Allow")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`deny_${options.toolUseID}`)
+        .setLabel("Deny")
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    const msg = await thread.send({
+      content: `🔒 **Permission Required**\nTool: **${toolName}**\n${summary}${reason}`,
+      components: [row],
+    });
+
+    try {
+      const interaction = await msg.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        time: 60_000,
+      });
+
+      if (interaction.customId.startsWith("allow")) {
+        await interaction.update({
+          content: `✅ **Allowed:** ${toolName} — ${summary}`,
+          components: [],
+        });
+        return { behavior: "allow" as const };
+      } else {
+        await interaction.update({
+          content: `❌ **Denied:** ${toolName} — ${summary}`,
+          components: [],
+        });
+        return { behavior: "deny" as const, message: "User denied via Discord" };
+      }
+    } catch {
+      await msg.edit({
+        content: `⏰ **Timed out:** ${toolName} — ${summary}`,
+        components: [],
+      }).catch(() => {});
+      return { behavior: "deny" as const, message: "Permission timed out (60s)" };
+    }
   };
 }
 
@@ -196,7 +251,8 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
       };
 
       const verbosity = getVerbosity(message.channel.id);
-      await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT, verbosity, message.id);
+      const permHandler = createDiscordPermissionHandler(thread);
+      await handleAgentRun(chatChannel, prompt, cwd, thread.id, reply, MSG_LIMIT, verbosity, message.id, permHandler);
       stop();
       return;
     }
@@ -243,7 +299,8 @@ export function createDiscordAdapter(config: DiscordConfig, watchDir?: string): 
     };
 
     const verbosity = getVerbosity(parentId);
-    await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT, verbosity, message.id);
+    const permHandler = createDiscordPermissionHandler(threadChannel);
+    await handleAgentRun(chatChannel, prompt, cwd, threadChannel.id, reply, MSG_LIMIT, verbosity, message.id, permHandler);
     stop();
   });
 

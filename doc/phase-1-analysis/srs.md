@@ -5,9 +5,9 @@
 | 項目 | 內容 |
 |------|------|
 | 專案名稱 | claude-discord Multi-Platform Bot |
-| 版本 | v1.1 |
+| 版本 | v1.2 |
 | 建立日期 | 2026-03-27 |
-| 最後修改 | 2026-03-29 |
+| 最後修改 | 2026-03-29 (v1.2) |
 | 狀態 | 草稿 |
 
 ---
@@ -24,9 +24,12 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - 新增 Slack bot 支援，與 Discord bot 功能對等
 - 重構為平台抽象架構（Adapter Pattern），使未來擴充其他平台更容易
 
-**v1.1（本次）：**
-- **主要目標**：為 Discord 和 Slack 新增 Verbosity Modes（訊息顯示層級控制），解決進度訊息洗版問題
-- **次要目標**：改善 agent 執行期間的狀態回報體驗（emoji reaction）
+**v1.1（已完成）：**
+- Verbosity Modes（quiet/normal/verbose）+ Emoji Reaction 狀態指示
+
+**v1.2（本次）：**
+- **主要目標**：讓 SDK 的權限安全機制在 Discord/Slack 上生效，高風險操作需使用者即時確認（Interactive Permission Confirmation）
+- **次要目標**：使 Discord/Slack bot 的安全行為與 terminal Claude Code 完全一致
 
 ### 1.3 範圍
 
@@ -38,18 +41,24 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - CLI 支援啟動指定平台或全部平台
 - init wizard 新增 Slack 設定流程
 
-**v1.1 範圍（本次新增）：**
+**v1.1 範圍（已完成）：**
 - 三段式 Verbosity Modes（quiet / normal / verbose）
-- 切換指令（`/quiet`、`/normal`、`/verbose`）
-- Edit-in-place 進度訊息（normal 模式）
-- Emoji reaction 狀態指示（⏳/✅/❌）
+- Edit-in-place 進度訊息 + Emoji reaction 狀態指示
+
+**v1.2 範圍（本次新增）：**
+- `permissionMode` 從 `bypassPermissions` 改為 `default`
+- `canUseTool` callback 實作（SDK 動態觸發，與 terminal 一致的安全邏輯）
+- Discord Button Components（Allow/Deny 按鈕）
+- Slack Block Kit actions（Allow/Deny 按鈕）
+- 超時處理（60 秒自動 deny）
+- Session resume 恢復機制（deny 後使用者可在 thread 回覆繼續）
 - 適用於 Discord 和 Slack 雙平台
 
 **不在本次範圍內：**
-- Slack Slash Commands（使用 Slack 原生 slash command 註冊）——沿用訊息觸發模式
-- Slack interactive components（buttons、modals）
+- Slack native Slash Commands
+- 自訂權限規則（完全由 SDK default mode 決定）
 - 其他平台（Teams、Telegram 等）
-- Per-thread verbosity override（未來可擴充）
+- Per-channel 或 per-user 的權限 override
 
 ### 1.4 參考系統
 
@@ -225,6 +234,81 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
   - Emoji reaction 是獨立於 verbosity 的功能，在所有模式下都運作
   - 如果 reaction API 呼叫失敗（例如權限不足），靜默忽略，不影響 agent 執行
 
+### 3.6 Interactive Permission Confirmation（v1.2 新增）
+
+#### US-015：SDK 權限模式切換
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望 bot 在執行高風險操作（git push、刪除檔案等）前先詢問我，而不是自動執行，以便我能控制哪些操作真的被執行
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** agent 開始執行，**When** SDK 判斷某個工具需要權限（依 `permissionMode: "default"` 的內建邏輯），**Then** agent stream 暫停，等待權限回應
+  2. **Given** SDK 判斷某個工具不需要權限（如 Read、Glob、Grep），**When** agent 呼叫該工具，**Then** 工具直接執行，不觸發任何確認流程
+  3. **Given** 同一 session 中已有多次工具呼叫，**Then** 只有 SDK 判定需要權限的呼叫才觸發確認，其餘自動放行
+- **備註**：
+  - SDK 的 `permissionMode: "default"` 判斷邏輯與 terminal Claude Code 完全一致
+  - 現有的 `bypassPermissions` 模式將被移除
+  - `canUseTool` callback 是 SDK 提供的 blocking async function，stream 會暫停到 callback resolve
+
+#### US-016：Discord 按鈕確認互動
+- **角色**：開發者（Discord）
+- **故事**：作為開發者，我希望在 Discord thread 中看到一個帶有 Allow/Deny 按鈕的確認訊息，以便快速決定是否允許操作
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** SDK 觸發 `canUseTool`，**When** bot 在 Discord thread 中發送確認訊息，**Then** 訊息包含：工具名稱、操作摘要、Allow 按鈕（綠色）、Deny 按鈕（紅色）
+  2. **Given** 確認訊息已發送，**When** 使用者點擊 Allow 按鈕，**Then** `canUseTool` 回傳 `{ behavior: "allow" }`，agent 繼續執行該工具
+  3. **Given** 確認訊息已發送，**When** 使用者點擊 Deny 按鈕，**Then** `canUseTool` 回傳 `{ behavior: "deny", message: "User denied via Discord" }`，agent 收到拒絕並決定下一步
+  4. **Given** 使用者點擊按鈕後，**Then** 按鈕變為 disabled 狀態，確認訊息更新為「✅ Allowed: {tool}」或「❌ Denied: {tool}」
+- **備註**：
+  - Discord 使用 `ActionRowBuilder` + `ButtonBuilder` 建立按鈕
+  - 使用 `awaitMessageComponent()` 等待使用者互動
+  - 按鈕互動不需要額外的 Gateway Intent（Message Content intent 已足夠）
+  - 確認訊息的格式範例：`🔒 **Permission Required**\nTool: Bash\nCommand: \`git push origin main\`\n[✅ Allow] [❌ Deny]`
+
+#### US-017：Slack 按鈕確認互動
+- **角色**：開發者（Slack）
+- **故事**：作為開發者，我希望在 Slack thread 中看到一個帶有 Allow/Deny 按鈕的確認訊息，以便快速決定是否允許操作
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** SDK 觸發 `canUseTool`，**When** bot 在 Slack thread 中發送確認訊息，**Then** 訊息包含：Block Kit 格式的文字說明 + actions block 含 Allow 按鈕（primary style）和 Deny 按鈕（danger style）
+  2. **Given** 確認訊息已發送，**When** 使用者點擊 Allow 按鈕，**Then** `canUseTool` 回傳 `{ behavior: "allow" }`，agent 繼續執行
+  3. **Given** 確認訊息已發送，**When** 使用者點擊 Deny 按鈕，**Then** `canUseTool` 回傳 `{ behavior: "deny", message: "User denied via Slack" }`
+  4. **Given** 使用者點擊按鈕後，**Then** 使用 `chat.update` 將按鈕訊息更新為「✅ Allowed: {tool}」或「❌ Denied: {tool}」（移除按鈕）
+- **備註**：
+  - Slack 使用 Block Kit：`section` block（文字說明）+ `actions` block（按鈕）
+  - 按鈕回呼使用 `app.action()` handler（Socket Mode 原生支援，不需 HTTP endpoint）
+  - 每個按鈕需要唯一的 `action_id`（建議含 timestamp 避免衝突）
+  - Slack 不需要額外的 bot scope（`chat:write` 已包含發送 Block Kit 的能力）
+
+#### US-018：超時自動拒絕
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，如果我不在線或來不及回應，我希望 bot 在等待一段時間後自動拒絕操作並告知我，以免 agent 無限等待
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** 確認訊息已發送，**When** 使用者在 60 秒內未點擊任何按鈕，**Then** `canUseTool` 回傳 `{ behavior: "deny", message: "Permission timed out (60s)" }`
+  2. **Given** 超時發生，**Then** 確認訊息更新為「⏰ Timed out: {tool}」（移除按鈕）
+  3. **Given** 超時導致 deny，**When** agent 收到拒絕，**Then** agent 依據 system prompt 的硬性約束停止流程並回報使用者
+  4. **Given** agent 因超時停止，**When** 使用者在同一 thread 中回覆（例如「繼續」「approved」），**Then** agent 透過 session resume 恢復上下文，重新嘗試被拒的操作，觸發新一輪的確認流程
+- **備註**：
+  - Discord：`awaitMessageComponent({ time: 60_000 })` 超時自動 reject
+  - Slack：`Promise.race([actionPromise, timeoutPromise])` 實現超時
+  - 超時時間 60 秒為硬編碼（YAGNI — 不做可配置）
+  - Session resume 是現有機制（`threadSessions` Map + SDK `resume` 參數），不需新增
+
+#### US-019：確認訊息內容格式
+- **角色**：開發者（Discord / Slack）
+- **故事**：作為開發者，我希望確認訊息清楚顯示要執行什麼操作，以便我做出正確的允許/拒絕決定
+- **優先級**：Must Have
+- **驗收標準**：
+  1. **Given** SDK 觸發 `canUseTool(toolName, input)`，**Then** 確認訊息包含工具名稱和人類可讀的操作摘要
+  2. **Given** 工具為 Bash，**Then** 摘要顯示完整指令（截斷至 200 字元）：`Command: \`git push origin main\``
+  3. **Given** 工具為 Edit/Write，**Then** 摘要顯示目標檔案路徑：`File: \`src/agent.ts\``
+  4. **Given** 工具為其他類型，**Then** 摘要顯示工具名稱和 input 的關鍵欄位
+  5. **Given** 確認訊息中的操作摘要，**Then** 使用與現有 `summarizeToolUse()` 相同的格式化邏輯（已在 agent.ts 中實作）
+- **備註**：
+  - 操作摘要複用 `summarizeToolUse()` 函式，不另寫新的格式化邏輯
+  - Discord 格式：Markdown（`**bold**`、`` `code` ``）
+  - Slack 格式：Mrkdwn（`*bold*`、`` `code` ``）
+
 ---
 
 ## 4. 視覺體驗層級評估
@@ -241,6 +325,8 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - 進度回報延遲：debounce 1.5s（與 Discord 一致）
 - Edit-in-place 更新延遲：遵循同一 debounce 週期（1.5s），不額外增加延遲
 - Emoji reaction 延遲：< 500ms（agent 開始後立即加 ⏳）
+- 權限確認訊息發送延遲：< 1s（SDK 觸發 canUseTool 後，按鈕訊息應在 1 秒內出現）
+- 權限確認超時：60 秒（硬編碼）
 
 ### 5.2 安全性需求
 - Bot token 存放在 ~/.claude-discord/.env，不進 git
@@ -311,6 +397,32 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - 若 reaction API 呼叫失敗（例如缺少 scope）→ 靜默忽略，不影響 agent 執行
 - 若 agent 在 edit-in-place 更新中途出錯 → 照常發送錯誤訊息 + ❌ reaction
 
+### 6.4 Interactive Permission Confirmation 流程（v1.2 新增）
+
+**正常流程（使用者在線，及時回應）：**
+1. Agent 執行中，SDK 判斷某工具需要權限
+2. SDK 呼叫 `canUseTool(toolName, input)` → stream 暫停
+3. Bot 在 thread 中發送按鈕確認訊息（Allow / Deny + 操作摘要）
+4. 使用者點擊 Allow → `canUseTool` resolve `{ behavior: "allow" }` → agent 繼續執行
+5. 或使用者點擊 Deny → `canUseTool` resolve `{ behavior: "deny" }` → agent 收到拒絕，依 system prompt 停止並回報
+
+**超時流程（使用者不在線或未回應）：**
+1. 步驟 1-3 同上
+2. 60 秒無回應 → `canUseTool` resolve `{ behavior: "deny", message: "Permission timed out" }`
+3. 確認訊息更新為「⏰ Timed out」（移除按鈕）
+4. Agent 收到拒絕 → 停止並回報「需要權限確認」
+
+**恢復流程（超時或 deny 後使用者回來）：**
+1. 使用者在同一 thread 回覆（例如「繼續」「go」）
+2. Bot 收到訊息 → `runAgent(prompt, cwd, threadId)` with `resume: sessionId`
+3. Agent 恢復上下文，重新嘗試被拒的操作
+4. SDK 再次觸發 `canUseTool` → 使用者這次在線，點擊 Allow → 操作執行
+
+**異常流程：**
+- 按鈕互動 API 失敗 → fallback 為 deny（安全導向：失敗時拒絕而非允許）
+- 同一確認訊息被點擊多次 → 按鈕已 disabled，第二次點擊無效
+- Agent 在等待確認時出錯 → `canUseTool` 的 AbortSignal 觸發，自動清理
+
 ---
 
 ## 7. 假設與限制
@@ -327,6 +439,9 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 - Slack `chat.update` 只能更新 bot 自己發送的訊息
 - Slack emoji reaction 需要 `reactions:write` scope（v1.1 新增需求）
 - Verbosity 設定為 runtime 狀態，bot 重啟後重置為 normal（不持久化）
+- Discord Button interaction 有 15 分鐘生命週期限制（但我們只等 60 秒，遠低於限制）
+- Slack Block Kit action 需要 Socket Mode（已使用）或 HTTP endpoint（不使用）
+- `canUseTool` 是 blocking callback——agent stream 在等待期間完全暫停，不會有其他工具執行
 
 ### 7.3 依賴
 - @slack/bolt（Slack Bot Framework）
@@ -346,6 +461,9 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 | Verbosity Mode | 訊息顯示層級。quiet = 只顯示結果；normal = edit-in-place 進度；verbose = 每個事件獨立訊息 |
 | Edit-in-place | 透過 API（Discord `Message.edit()` / Slack `chat.update`）原地更新已發送的訊息，而非發送新訊息 |
 | Emoji Reaction | 在使用者訊息上加的 emoji 標記，用於快速指示 agent 執行狀態（⏳/✅/❌） |
+| canUseTool | Claude Agent SDK 提供的 blocking async callback，在 `permissionMode: "default"` 下，SDK 判斷需要權限時呼叫。回傳 allow/deny 決定工具是否執行 |
+| Permission Confirmation | 在 Discord/Slack thread 中發送帶有 Allow/Deny 按鈕的訊息，等待使用者點擊回應 |
+| Session Resume | 透過 `threadSessions` Map 和 SDK 的 `resume` 參數，讓 agent 在新一輪執行中恢復先前的對話上下文 |
 
 ---
 
@@ -355,3 +473,4 @@ claude-discord 是一個讓開發者從 Discord 操作 Claude Code 的 bot。本
 |------|------|---------|--------|
 | v1.0 | 2026-03-27 | 初版建立（Slack 平台擴充） | SA |
 | v1.1 | 2026-03-29 | 新增 Verbosity Modes 功能需求（US-010~US-014） | SA |
+| v1.2 | 2026-03-29 | 新增 Interactive Permission Confirmation（US-015~US-019） | SA |

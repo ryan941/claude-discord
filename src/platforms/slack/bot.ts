@@ -1,8 +1,9 @@
 import { App, LogLevel } from "@slack/bolt";
 import { SlackConfig } from "../../config";
-import { ChatChannel, PlatformAdapter, ReplyHandler, VerbosityMode } from "../types";
+import { ChatChannel, PlatformAdapter, ReplyHandler, VerbosityMode, PermissionHandler } from "../types";
 import { handleAgentRun } from "../utils";
 import { resolveSkill, buildSkillPrompt, listSkills, preloadSkills } from "../../skills";
+import { summarizeToolUse } from "../../agent";
 import { syncSlackProjects, startSlackWatcher } from "./watcher";
 
 const SLACK_MSG_LIMIT = 4000;
@@ -24,6 +25,69 @@ export function createSlackAdapter(config: SlackConfig, watchDir?: string): Plat
   const channelVerbosity = new Map<string, VerbosityMode>();
   const getVerbosity = (channelId: string): VerbosityMode =>
     channelVerbosity.get(channelId) ?? "normal";
+
+  // --- Permission confirmation infrastructure ---
+  const pendingPermissions = new Map<string, (allowed: boolean) => void>();
+
+  app.action(/^(perm_allow|perm_deny)_/, async ({ action, ack, client, body }) => {
+    await ack();
+    const act = action as { action_id: string };
+    const parts = act.action_id.split("_");
+    const allowed = parts[1] === "allow";
+    const uniqueId = parts.slice(2).join("_");
+
+    const resolve = pendingPermissions.get(uniqueId);
+    if (resolve) {
+      resolve(allowed);
+      pendingPermissions.delete(uniqueId);
+    }
+
+    const msgBody = body as { container?: { channel_id?: string; message_ts?: string } };
+    const ch = msgBody.container?.channel_id;
+    const ts = msgBody.container?.message_ts;
+    if (ch && ts) {
+      const status = allowed ? "✅ *Allowed*" : "❌ *Denied*";
+      await client.chat.update({ channel: ch, ts, blocks: [{ type: "section", text: { type: "mrkdwn", text: status } }], text: status }).catch(() => {});
+    }
+  });
+
+  function createSlackPermissionHandler(
+    slackClient: typeof app.client,
+    ch: string,
+    threadTs: string,
+  ): PermissionHandler {
+    return async (toolName, input, options) => {
+      const summary = summarizeToolUse(toolName, input);
+      const reason = options.decisionReason ? `\nReason: ${options.decisionReason}` : "";
+      const uniqueId = `${Date.now()}_${options.toolUseID}`;
+
+      await slackClient.chat.postMessage({
+        channel: ch,
+        thread_ts: threadTs,
+        blocks: [
+          { type: "section", text: { type: "mrkdwn", text: `🔒 *Permission Required*\nTool: *${toolName}*\n${summary}${reason}` } },
+          { type: "actions", elements: [
+            { type: "button", text: { type: "plain_text", text: "✅ Allow" }, action_id: `perm_allow_${uniqueId}`, style: "primary" },
+            { type: "button", text: { type: "plain_text", text: "❌ Deny" }, action_id: `perm_deny_${uniqueId}`, style: "danger" },
+          ]},
+        ],
+        text: `🔒 Permission Required: ${toolName}`,
+      });
+
+      try {
+        const userAllowed = await Promise.race<boolean>([
+          new Promise<boolean>((resolve) => { pendingPermissions.set(uniqueId, resolve); }),
+          new Promise<boolean>((_, reject) => { setTimeout(() => reject(new Error("timeout")), 60_000); }),
+        ]);
+        return userAllowed
+          ? { behavior: "allow" as const }
+          : { behavior: "deny" as const, message: "User denied via Slack" };
+      } catch {
+        pendingPermissions.delete(uniqueId);
+        return { behavior: "deny" as const, message: "Permission timed out (60s)" };
+      }
+    };
+  }
 
   // Listen to all messages
   app.event("message", async ({ event, client }) => {
@@ -202,7 +266,8 @@ export function createSlackAdapter(config: SlackConfig, watchDir?: string): Plat
 
     // --- Run agent ---
     const verbosity = getVerbosity(channelId);
-    await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT, verbosity, messageTs);
+    const permHandler = createSlackPermissionHandler(client, channelId, replyTs);
+    await handleAgentRun(chatChannel, prompt, cwd, sessionKey, reply, SLACK_MSG_LIMIT, verbosity, messageTs, permHandler);
   });
 
   return {

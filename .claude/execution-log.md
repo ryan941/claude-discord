@@ -3,9 +3,9 @@
 ## 專案資訊
 - **專案名稱**：claude-discord
 - **建立日期**：2026-03-27
-- **目前狀態**：DONE — v1.2.0 已交付
+- **目前狀態**：PHASE_1_ANALYSIS — Feature: Interactive Permission Confirmation
 - **阻塞事項**：無
-- **下一步動作**：無（等待 git push 確認）
+- **下一步動作**：BE 實作
 
 ## 已完成交付物
 - ✅ SRS v1.0（Slack 擴充）— `doc/phase-1-analysis/srs.md` — 2026-03-27
@@ -137,6 +137,46 @@
   - ✅ build 驗證通過（零錯誤）
   - ✅ Critical=0, High=0
 - **下一步**：Phase 5 交付（Doc Writer → Git-Ops → Skill Evolver）
+
+#### [01:00] PM — Feature 啟動：Interactive Permission Confirmation
+- **Phase**：PHASE_1_ANALYSIS
+- **動作**：啟動新 feature 流程。使用者確認設計方向：permissionMode 改為 default + canUseTool callback，SDK 動態判斷需要權限時透過 Discord Buttons / Slack Block Kit 詢問使用者
+- **輸入**：使用者需求 + SDK 調查結果（canUseTool API 確認可行）
+- **輸出**：需求方向確認
+- **結果**：✅ 完成
+- **決策記錄**：
+  - permissionMode 從 bypassPermissions → default
+  - canUseTool callback 由 SDK 動態觸發（與 terminal 一致的安全邏輯）
+  - 超時 60 秒自動 deny，使用者可透過 session resume 恢復
+  - 不做額外配置，權限判斷完全由 SDK default mode 決定
+  - Discord 用 Button Components，Slack 用 Block Kit
+- **下一步**：調用 SA 分析需求
+
+#### [01:05] SA — 需求分析：Interactive Permission Confirmation
+- **Phase**：PHASE_1_ANALYSIS
+- **動作**：分析需求，更新 SRS 為 v1.2
+- **輸入**：使用者需求 + SDK 調查結果 + 現有 codebase
+- **輸出**：`doc/phase-1-analysis/srs.md`（v1.2，新增 US-015~US-019）
+- **結果**：✅ 完成
+- **決策記錄**：
+  - 5 個 user stories：SDK 權限切換、Discord 按鈕、Slack 按鈕、超時 deny、訊息格式
+  - 權限判斷完全由 SDK default mode 決定
+  - 超時 60 秒硬編碼
+  - 失敗 fallback 為 deny（安全導向）
+  - 複用 summarizeToolUse() 現有邏輯
+- **下一步**：調用 Architect 可行性評估
+
+#### [01:10] Architect — 可行性評估：Interactive Permission
+- **Phase**：PHASE_1_ANALYSIS
+- **動作**：評估 canUseTool + Discord Buttons + Slack Block Kit 可行性
+- **輸出**：`doc/phase-1-analysis/feasibility-report.md`（v1.2，Section 8）
+- **結果**：✅ 通過
+- **決策**：Callback Injection 保持 agent.ts 平台無關、Discord awaitMessageComponent、Slack pendingPermissions Map + app.action
+- **下一步**：Phase 1→2 閘門 → SD
+
+#### [01:12] PM — Phase 1 → Phase 2 轉換閘門（Permission feature）
+- **Phase**：PHASE_1 → PHASE_2
+- **結果**：✅ 全部通過（SRS v1.2 + 可行性 v1.2 + tech-stack 沿用）
 
 #### [00:25] PM — Phase 1 → Phase 2 轉換閘門
 - **Phase**：PHASE_1 → PHASE_2

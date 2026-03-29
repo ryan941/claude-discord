@@ -1,4 +1,4 @@
-import { ChatChannel, ReplyHandler, VerbosityMode } from "./types";
+import { ChatChannel, ReplyHandler, VerbosityMode, PermissionHandler } from "./types";
 import { runAgent, StreamCallbacks } from "../agent";
 import { readdirSync, statSync, existsSync } from "fs";
 import { join } from "path";
@@ -152,6 +152,7 @@ export async function handleAgentRun(
   msgLimit: number,
   verbosity: VerbosityMode = "normal",
   userMessageId?: string,
+  permissionHandler?: PermissionHandler,
 ): Promise<void> {
   channel.sendTyping();
 
@@ -206,7 +207,7 @@ export async function handleAgentRun(
   };
 
   try {
-    const result = await runAgent(prompt, cwd, threadId, callbacks);
+    const result = await runAgent(prompt, cwd, threadId, callbacks, permissionHandler);
 
     if (textTimer) clearTimeout(textTimer);
     await flushText();

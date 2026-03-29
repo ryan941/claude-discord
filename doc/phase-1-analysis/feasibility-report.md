@@ -4,7 +4,7 @@
 
 | 項目 | 內容 |
 |------|------|
-| 版本 | v1.1 |
+| 版本 | v1.2 |
 | 建立日期 | 2026-03-27 |
 | 最後修改 | 2026-03-29 |
 | 規模等級 | S（CLI 工具 + Bot） |
@@ -303,9 +303,203 @@ const channelVerbosity = new Map<string, "quiet" | "normal" | "verbose">();
 
 ---
 
+## 8. Interactive Permission Confirmation 可行性評估（v1.2 新增）
+
+### 8.1 SDK canUseTool API 確認
+
+**已驗證 SDK 型別定義**（`@anthropic-ai/claude-agent-sdk/sdk.d.ts`）：
+
+```typescript
+type CanUseTool = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options: {
+    signal: AbortSignal;
+    suggestions?: PermissionUpdate[];
+    blockedPath?: string;
+    decisionReason?: string;
+    toolUseID: string;
+    agentID?: string;
+  }
+) => Promise<PermissionResult>;
+
+type PermissionResult =
+  | { behavior: "allow"; updatedInput?: Record<string, unknown>; updatedPermissions?: PermissionUpdate[] }
+  | { behavior: "deny"; message: string; interrupt?: boolean };
+```
+
+`query()` 的 `Options` 已包含 `canUseTool?: CanUseTool` 參數。與 `permissionMode: "default"` 搭配使用時，SDK 動態判斷哪些工具需要權限，只對需要權限的工具呼叫 `canUseTool`。
+
+**結論**：SDK 原生支援，API 穩定，無需 workaround。
+
+### 8.2 架構橋接方案
+
+**核心挑戰**：`agent.ts` 是平台無關的，但 `canUseTool` callback 需要發送平台特定的按鈕訊息（Discord Buttons / Slack Block Kit）。
+
+**方案：Callback Injection（依賴反轉）**
+
+```
+Platform Adapter（Discord/Slack）
+    │ 建立 canUseTool callback（閉包捕獲平台物件）
+    ↓
+handleAgentRun(channel, prompt, cwd, ..., permissionHandler)
+    │ 透傳
+    ↓
+runAgent(prompt, cwd, threadId, callbacks, permissionHandler)
+    │ 傳給 SDK
+    ↓
+query({ prompt, options: { canUseTool: permissionHandler, permissionMode: "default" } })
+```
+
+**具體做法**：
+1. 新增 `PermissionHandler` type（與 SDK 的 `CanUseTool` 對齊）到 `types.ts`
+2. `runAgent()` 新增 optional `permissionHandler` 參數
+3. `handleAgentRun()` 新增 optional `permissionHandler` 參數，透傳給 `runAgent()`
+4. 各平台 adapter 建立閉包 callback，捕獲平台特定的 channel/client 物件
+
+**為什麼用 Callback Injection 而非擴充 ChatChannel**：
+- `canUseTool` 需要的是「發送按鈕 + 等待互動回應」，這是一個完整的 request-response 週期
+- `ChatChannel` 的 `send()` 是 fire-and-forget，不適合等待使用者互動
+- Discord 的 `awaitMessageComponent()` 和 Slack 的 `app.action()` 是完全不同的互動模型，不適合統一到一個介面
+- Callback 讓每個平台自由選擇最適合的互動實作
+
+### 8.3 Discord Button 技術要點
+
+**API**：
+```typescript
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+
+// 發送按鈕訊息
+const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  new ButtonBuilder().setCustomId("allow").setLabel("Allow").setStyle(ButtonStyle.Success),
+  new ButtonBuilder().setCustomId("deny").setLabel("Deny").setStyle(ButtonStyle.Danger),
+);
+const msg = await thread.send({ content: "🔒 Permission Required\n...", components: [row] });
+
+// 等待互動（blocking，帶超時）
+const interaction = await msg.awaitMessageComponent({ time: 60_000 });
+await interaction.update({ content: "✅ Allowed", components: [] });  // 移除按鈕
+```
+
+**技術確認**：
+- `awaitMessageComponent()` 是 discord.js v14 的原生 API ✅
+- 不需要額外的 Gateway Intent（`GuildMessages` + `MessageContent` 已足夠）✅
+- 超時自動 reject promise → catch 中回傳 deny ✅
+- `interaction.update()` 可同時更新文字和移除按鈕（設 `components: []`）✅
+- 按鈕互動有 3 秒回應期限（`interaction.update` 或 `interaction.deferUpdate`）——在 callback 內直接呼叫，不會超過 ✅
+
+### 8.4 Slack Block Kit 技術要點
+
+**API**：
+```typescript
+// 發送 Block Kit 按鈕訊息
+const result = await client.chat.postMessage({
+  channel: channelId,
+  thread_ts: replyTs,
+  blocks: [
+    { type: "section", text: { type: "mrkdwn", text: "🔒 *Permission Required*\n..." } },
+    { type: "actions", block_id: `perm_${uniqueId}`, elements: [
+      { type: "button", text: { type: "plain_text", text: "✅ Allow" }, action_id: `allow_${uniqueId}`, style: "primary" },
+      { type: "button", text: { type: "plain_text", text: "❌ Deny" }, action_id: `deny_${uniqueId}`, style: "danger" },
+    ]},
+  ],
+});
+
+// 等待互動（需要 Promise 橋接）
+```
+
+**Slack 互動的關鍵挑戰：`app.action()` 是 event-driven，不是 request-response**
+
+Discord 的 `awaitMessageComponent()` 天然 blocking，但 Slack 的 `app.action()` 是全域 handler，需要 Promise 橋接：
+
+```typescript
+// 橋接策略：用 Map<actionId, resolve> 做 pending promise registry
+const pendingPermissions = new Map<string, (allowed: boolean) => void>();
+
+// 全域 action handler（在 createSlackAdapter 中註冊一次）
+app.action(/^(allow|deny)_/, async ({ action, ack, client }) => {
+  await ack();
+  const actionId = action.action_id;
+  const uniqueId = actionId.split("_").slice(1).join("_");
+  const resolve = pendingPermissions.get(uniqueId);
+  if (resolve) {
+    resolve(actionId.startsWith("allow"));
+    pendingPermissions.delete(uniqueId);
+  }
+  // 更新訊息移除按鈕
+  await client.chat.update({ channel, ts, blocks: [{ type: "section", text: "✅ Allowed" }] });
+});
+
+// 在 canUseTool callback 中
+const uniqueId = `${Date.now()}_${toolUseID}`;
+// 發送按鈕...
+const userChoice = await Promise.race([
+  new Promise<boolean>(resolve => pendingPermissions.set(uniqueId, resolve)),
+  new Promise<boolean>((_, reject) => setTimeout(() => reject("timeout"), 60_000)),
+]);
+```
+
+**技術確認**：
+- `app.action()` 在 Socket Mode 下原生支援 ✅
+- 不需要 HTTP endpoint ✅
+- 不需要額外 Slack scope（`chat:write` 已包含 Block Kit）✅
+- `action_id` 用 timestamp + toolUseID 確保唯一性 ✅
+- `ack()` 必須在 3 秒內呼叫（handler 內直接呼叫，不會超過）✅
+
+### 8.5 超時處理
+
+| 平台 | 超時機制 | 失敗行為 |
+|------|---------|---------|
+| Discord | `awaitMessageComponent({ time: 60_000 })` → reject | catch → deny |
+| Slack | `Promise.race([actionPromise, timeoutPromise])` → reject | catch → deny |
+
+**兩平台超時後的共同行為**：
+1. `canUseTool` 回傳 `{ behavior: "deny", message: "Permission timed out (60s)" }`
+2. 更新按鈕訊息為「⏰ Timed out」（移除按鈕）
+3. 清理 pending registry（Slack）
+4. Agent 收到 deny → 依 system prompt 停止並回報
+
+### 8.6 變更量評估
+
+| 檔案 | 變更量 | 說明 |
+|------|--------|------|
+| agent.ts | ~15 行修改 | runAgent 新增 permissionHandler 參數，query options 加入 canUseTool + permissionMode 改為 "default" |
+| platforms/types.ts | ~5 行新增 | PermissionHandler type alias |
+| platforms/utils.ts | ~5 行修改 | handleAgentRun 新增 permissionHandler 參數，透傳給 runAgent |
+| platforms/discord/bot.ts | ~50 行新增 | 建立 canUseTool 閉包（ActionRow + ButtonBuilder + awaitMessageComponent） |
+| platforms/slack/bot.ts | ~60 行新增 | pendingPermissions Map + app.action handler + 建立 canUseTool 閉包（Block Kit + Promise 橋接） |
+| skills.ts | 0 行 | 不動 |
+| config.ts | 0 行 | 不動 |
+
+**總計**：~135 行變更/新增。
+
+### 8.7 風險評估
+
+| 風險 | 嚴重度 | 機率 | 緩解措施 |
+|------|--------|------|---------|
+| Slack action handler 未收到 ack → Slack 重試 | 中 | 低 | handler 開頭立即 `await ack()` |
+| pendingPermissions Map 記憶體洩漏（超時未清理）| 低 | 低 | 超時的 catch 中主動 delete |
+| Discord interaction 3 秒回應期限 | 低 | 極低 | update 在 handler 內直接呼叫 |
+| 從 bypassPermissions 切換到 default 後的行為差異 | 中 | 中 | 充分測試，確認 SDK 的 default 邏輯符合預期 |
+| 同時多個 permission request 互相干擾 | 低 | 低 | 用 unique action_id 隔離 |
+
+### 8.8 可行性判定
+
+**✅ 可行**
+
+- SDK 原生支援 `canUseTool` callback，API 清晰穩定
+- Discord `awaitMessageComponent()` 和 Slack `app.action()` 都是成熟 API
+- Callback Injection 模式保持 agent.ts 的平台無關性
+- 變更量 ~135 行，集中在 agent.ts 和兩個 adapter
+- 超時處理兩平台都有原生支援
+- 失敗安全：所有異常都 fallback 為 deny
+
+---
+
 ## 變更記錄
 
 | 版本 | 日期 | 變更內容 | 變更者 |
 |------|------|---------|--------|
 | v1.0 | 2026-03-27 | 初版建立（Slack 擴充） | Architect |
 | v1.1 | 2026-03-29 | 新增 Verbosity Modes 可行性評估（Section 7） | Architect |
+| v1.2 | 2026-03-29 | 新增 Interactive Permission Confirmation 可行性評估（Section 8） | Architect |

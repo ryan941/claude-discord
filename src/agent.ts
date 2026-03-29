@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionHandler } from "./platforms/types";
 
 export interface AgentResult {
   text: string;
@@ -33,7 +34,7 @@ export function setSessionId(threadId: string, sessionId: string): void {
 // Track last tool name for correlating with tool_result
 let lastToolName = "";
 
-function summarizeToolUse(toolName: string, input: Record<string, unknown>): string {
+export function summarizeToolUse(toolName: string, input: Record<string, unknown>): string {
   switch (toolName) {
     case "Read":
     case "read_file": {
@@ -106,7 +107,8 @@ export async function runAgent(
   prompt: string,
   cwd: string,
   threadId: string,
-  callbacks?: StreamCallbacks
+  callbacks?: StreamCallbacks,
+  permissionHandler?: PermissionHandler,
 ): Promise<AgentResult> {
   const sessionId = threadSessions.get(threadId);
 
@@ -115,7 +117,8 @@ export async function runAgent(
     options: {
       cwd,
       resume: sessionId,
-      permissionMode: "bypassPermissions",
+      permissionMode: permissionHandler ? "default" : "bypassPermissions",
+      canUseTool: permissionHandler,
       systemPrompt: {
         type: "preset",
         preset: "claude_code",

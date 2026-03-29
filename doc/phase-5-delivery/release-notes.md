@@ -2,6 +2,92 @@
 
 ---
 
+# v1.3.0: Interactive Permission Confirmation
+
+## Overview
+
+The bot now respects Claude Code's **built-in permission system**. When the SDK determines that a tool requires user approval (e.g., `git push`, destructive file operations), the bot sends an interactive **Allow/Deny** button in the thread. The user clicks to approve or reject — no more blind `bypassPermissions`.
+
+The permission logic is identical to terminal Claude Code (`permissionMode: "default"`). Low-risk operations (Read, Glob, Grep) execute automatically; high-risk operations prompt for confirmation.
+
+---
+
+## New Features
+
+### Permission Confirmation Buttons
+
+When Claude tries to execute a tool that requires permission:
+
+**Discord:**
+```
+🔒 **Permission Required**
+Tool: **Bash**
+Running `git push origin main`
+Reason: This command may modify remote repository
+
+[✅ Allow]  [❌ Deny]
+```
+
+**Slack:**
+Same layout using Block Kit buttons (primary/danger styles).
+
+### Timeout & Recovery
+
+- If you don't respond within **60 seconds**, the operation is automatically **denied** (fail-safe)
+- The agent stops and tells you it needs permission
+- **Resume anytime**: just reply in the same thread (e.g., "go ahead") — the agent picks up where it left off via session resume and will re-prompt for permission
+
+### Button States
+
+After clicking or timeout, the button message updates:
+- `✅ Allowed: Bash — Running \`git push origin main\``
+- `❌ Denied: Bash — Running \`git push origin main\``
+- `⏰ Timed out: Bash — Running \`git push origin main\``
+
+---
+
+## Behavior Change
+
+**`permissionMode` changed from `bypassPermissions` to `default`.**
+
+Previously, all tool calls executed without any approval. Now, the SDK dynamically determines which tools need permission — the same logic used in terminal Claude Code. Most operations still execute automatically; only potentially destructive ones trigger the confirmation prompt.
+
+---
+
+## Configuration
+
+**No new environment variables or bot scopes required.** Discord Button interactions and Slack Block Kit actions work with existing permissions.
+
+---
+
+## Backward Compatibility
+
+**Fully backward compatible:**
+
+- If `runAgent()` is called without a `permissionHandler` (e.g., from tests), it falls back to `bypassPermissions` mode automatically
+- `skills.ts` and `config.ts` were **not modified**
+- Existing verbosity modes, emoji reactions, and all other features continue to work unchanged
+
+---
+
+## Architecture Changes
+
+- `agent.ts`: `runAgent()` accepts optional `permissionHandler` callback; `summarizeToolUse()` now exported for reuse
+- `platforms/types.ts`: New `PermissionHandler` type (aligns with SDK's `CanUseTool` signature)
+- `platforms/utils.ts`: `handleAgentRun()` threads `permissionHandler` to `runAgent()`
+- `platforms/discord/bot.ts`: `createDiscordPermissionHandler()` — closure over `ThreadChannel`, uses `awaitMessageComponent()`
+- `platforms/slack/bot.ts`: `createSlackPermissionHandler()` + `pendingPermissions` Map + `app.action()` regex handler for Promise bridging
+
+---
+
+## Dependencies
+
+No new dependencies. No new bot scopes required.
+
+---
+
+---
+
 # v1.2.0: Verbosity Modes & Emoji Reactions
 
 ## Overview

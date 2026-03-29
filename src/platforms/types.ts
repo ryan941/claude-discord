@@ -23,3 +23,20 @@ export interface PlatformAdapter {
   start(): Promise<void>;
   stop(): Promise<void>;
 }
+
+/** Permission handler callback. Matches SDK's CanUseTool signature. */
+export type PermissionHandler = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options: {
+    signal: AbortSignal;
+    suggestions?: unknown[];
+    blockedPath?: string;
+    decisionReason?: string;
+    toolUseID: string;
+    agentID?: string;
+  },
+) => Promise<
+  | { behavior: "allow"; updatedInput?: Record<string, unknown> }
+  | { behavior: "deny"; message: string; interrupt?: boolean }
+>;
